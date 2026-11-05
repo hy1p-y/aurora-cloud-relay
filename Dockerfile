@@ -8,8 +8,11 @@ ENV PORT=8080
 ENV DATA_DIR=/app/data
 ENV NODE_ENV=production
 
+# Install git and build essentials needed for git dependencies (e.g. libsignal-node)
+RUN apk add --no-cache git python3 make g++
+
 # install deps first (cached layer)
-COPY package.json ./
+COPY package*.json ./
 RUN npm install --omit=dev && npm cache clean --force
 
 COPY src ./src
