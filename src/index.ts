@@ -906,8 +906,8 @@ async function waInitInner() {
     browser: browserProfile,
     logger: mkSilentLogger(),
     markOnlineOnConnect: false,      // don't force "online" presence on free tier
-    syncFullHistory: true,           // sync chats & contacts
-    shouldSyncHistoryMessage: () => true, // accept WhatsApp history sync chunks
+    syncFullHistory: false,          // don't require full sync in companion registration (avoids 428 disconnects)
+    shouldSyncHistoryMessage: () => true, // accept and process WhatsApp history sync chunks
     generateHighQualityLinkPreview: false,
   })
   wa.sock = sock
