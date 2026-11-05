@@ -10,7 +10,9 @@ services:
     envVars:
       - key: AUTH_TOKEN
         sync: false
-      - key: TELEGRAM_BOT_TOKEN
+      - key: TG_API_ID
+        sync: false
+      - key: TG_API_HASH
         sync: false
       - key: RELAY_NAME
         value: Aurora Cloud Relay

@@ -1,7 +1,7 @@
 {
   "name": "aurora-cloud-relay",
-  "version": "1.0.0",
-  "description": "Server-only bridge between AuroraSuite.exe (desktop ImGui command center) and Telegram/WhatsApp. Holds platform connections online 24/7 and relays events/actions. No bot logic — the desktop exe is the brain.",
+  "version": "2.0.0",
+  "description": "Server-only bridge between VANTA desktop exe and YOUR OWN Telegram account (MTProto userbot) + WhatsApp. Holds platform connections online 24/7, relays events/actions, backs up sessions to the exe. No bot logic — the desktop exe is the brain.",
   "type": "module",
   "main": "src/index.ts",
   "scripts": {
@@ -13,6 +13,7 @@
     "@whiskeysockets/baileys": "^6.7.16",
     "@hapi/boom": "^10.0.1",
     "qrcode": "^1.5.4",
+    "telegram": "^2.22.2",
     "tsx": "^4.19.2"
   },
   "engines": {
