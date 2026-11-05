@@ -1,7 +1,7 @@
 {
   "name": "aurora-cloud-relay",
-  "version": "2.1.0",
-  "description": "Server-only bridge between VANTA desktop exe and YOUR OWN Telegram account (MTProto userbot) + WhatsApp. Holds platform connections online 24/7, relays events/actions, backs up sessions to the exe. No bot logic — the desktop exe is the brain. v2.1: pairing hardening (phone normalization, auto creds reset, fresh pairing codes).",
+  "version": "2.2.0",
+  "description": "Server-only bridge between VANTA desktop exe and YOUR OWN Telegram account (MTProto userbot) + WhatsApp. v2.2: view-once media auto-download + chat directory for pickers + poll/presence actions + lenient chat addressing.",
   "type": "module",
   "main": "src/index.ts",
   "scripts": {

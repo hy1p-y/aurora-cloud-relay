@@ -32,7 +32,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import zlib from 'node:zlib'
 
-const RELAY_VERSION = '2.1.0'
+const RELAY_VERSION = '2.2.0'
 const PORT = Number(process.env.PORT || 8080)
 const DATA_DIR = process.env.DATA_DIR || './data'
 const RELAY_NAME = process.env.RELAY_NAME || 'Aurora Cloud Relay'
@@ -56,6 +56,9 @@ function loadToken(): string {
 }
 const TOKEN = loadToken()
 const startedAt = Date.now()
+// relay boot identity — the exe uses it to detect restarts and reset its
+// event cursor (buffered events die with the process, so seq numbers reset)
+const BOOT_ID = crypto.randomUUID().slice(0, 13)
 
 // pino-compatible silent logger (Baileys calls .error() etc on children)
 const mkSilentLogger = (): any => ({
@@ -91,6 +94,118 @@ function pushEvent(e: Omit<Ev, 'seq' | 'ts'>) {
   notifyWaiters()
   const line = `[ev ${ev.seq}] ${ev.platform}/${ev.type} ${ev.chat || ''} ${ev.fromName || ev.from || ''}: ${(ev.text || '').slice(0, 120)}`
   console.log(line)
+}
+
+// ============================================== CHAT DIRECTORY (exe pickers)
+// Lists the account's real chats/groups/contacts so the exe can render a
+// searchable picker instead of making the user type raw JIDs by hand.
+interface ChatEntry { platform: 'wa' | 'tg'; id: string; name: string; type: 'user' | 'group' | 'channel'; ts: number }
+const waChats = new Map<string, ChatEntry>()
+const waLastSeenId = new Map<string, string>()  // newest message id per chat (read-all)
+let tgDialogs: ChatEntry[] = []
+let tgDialogsAt = 0
+function upsertWaChat(jid: string, name: string, ts: number) {
+  if (!jid || jid === 'status@broadcast' || jid.endsWith('@newsletter')) return
+  const prev = waChats.get(jid)
+  const type: ChatEntry['type'] = jid.endsWith('@g.us') ? 'group' : 'user'
+  const nm = (name || prev?.name || '').slice(0, 120)
+  waChats.set(jid, { platform: 'wa', id: jid, name: nm, type, ts: Math.max(ts || 0, prev?.ts || 0) })
+}
+async function tgFetchDialogs() {
+  if (!tg.client || !tg.authorized) return
+  const out: ChatEntry[] = []
+  try {
+    for await (const d of tg.client.iterDialogs({ limit: 250 })) {
+      try {
+        const ent: any = d.entity
+        const id = String((d as any).id?.value ?? ent?.id ?? '')
+        if (!id) continue
+        const cls = String(ent?.className || '')
+        const type: ChatEntry['type'] = d.isGroup || cls.includes('Chat') ? 'group' : cls.includes('Channel') ? 'channel' : 'user'
+        const name = String(d.title || ent?.title || ent?.username || ent?.firstName || id).slice(0, 120)
+        out.push({ platform: 'tg', id, name, type, ts: Number(d.date || 0) * 1000 || 0 })
+      } catch { /* one bad dialog */ }
+    }
+  } catch { /* session not ready */ }
+  tgDialogs = out
+  tgDialogsAt = Date.now()
+}
+
+// ============================================== MEDIA PIPELINE (view-once!)
+// WhatsApp view-once media must be downloaded the instant it arrives —
+// before the recipient opens it (and before any free-tier restart wipes it).
+// The file lands in DATA_DIR/media and the exe pulls it via /api/media/:id.
+const MEDIA_DIR = path.join(DATA_DIR, 'media')
+const mediaMsgCache = new Map<string, any>()   // recent raw messages (on-demand fetch)
+const MEDIA_CACHE_MAX = 40
+function extFromMime(mime: string, mediaType: string): string {
+  const m = String(mime || '').toLowerCase()
+  if (m.includes('jpeg') || m.includes('jpg')) return 'jpg'
+  if (m.includes('png')) return 'png'
+  if (m.includes('webp')) return 'webp'
+  if (m.includes('gif')) return 'gif'
+  if (m.includes('mp4')) return 'mp4'
+  if (m.includes('webm')) return 'webm'
+  if (m.includes('ogg') || m.includes('opus')) return 'ogg'
+  if (m.includes('pdf')) return 'pdf'
+  if (m.includes('mpeg')) return 'mp3'
+  if (mediaType === 'image') return 'jpg'
+  if (mediaType === 'video') return 'mp4'
+  if (mediaType === 'audio') return 'ogg'
+  if (mediaType === 'sticker') return 'webp'
+  return 'bin'
+}
+function mediaFile(mediaId: string): string | null {
+  const safe = String(mediaId || '').replace(/[^A-Za-z0-9_-]/g, '').slice(0, 48)
+  if (!safe) return null
+  try {
+    const files = fs.readdirSync(MEDIA_DIR).filter((f: string) => f.startsWith(safe + '.'))
+    return files.length ? path.join(MEDIA_DIR, files[0]) : null
+  } catch { return null }
+}
+function trimMediaDir() {
+  try {
+    const files = fs.readdirSync(MEDIA_DIR)
+      .map((f: string) => ({ f, t: fs.statSync(path.join(MEDIA_DIR, f)).mtimeMs }))
+      .sort((a: any, b: any) => b.t - a.t)
+    for (const x of files.slice(MEDIA_CACHE_MAX)) fs.rmSync(path.join(MEDIA_DIR, x.f), { force: true })
+  } catch { /* empty dir */ }
+}
+// message → { mediaId, mime, size, mediaType, viewOnce, caption } or null
+function mediaOf(message: any) {
+  const c = message?.message || {}
+  const vo = c.viewOnceMessage?.message || c.viewOnceMessageV2?.message || null
+  const inner: any = vo || c
+  const holders = ['imageMessage', 'videoMessage', 'audioMessage', 'stickerMessage', 'documentMessage']
+  for (const k of holders) {
+    const m = inner[k]
+    if (m) {
+      const mediaType = k.replace('Message', '')
+      return {
+        mediaType,
+        viewOnce: !!vo,
+        mime: String(m.mimetype || ''),
+        size: Number(m.fileLength || 0) || 0,
+        caption: String(m.caption || ''),
+        secs: Number(m.seconds || 0) || 0,
+      }
+    }
+  }
+  return null
+}
+async function downloadWaMedia(message: any, mediaId: string, mime: string, mediaType: string): Promise<{ file: string; size: number }> {
+  const baileys: any = await import('@whiskeysockets/baileys')
+  const c = message.message || {}
+  const vo = c.viewOnceMessage?.message || c.viewOnceMessageV2?.message
+  // unwrap view-once so the downloader sees imageMessage/videoMessage directly
+  const dlMsg = vo ? { key: message.key, message: vo } : message
+  const buf: Buffer = await baileys.downloadMediaMessage(dlMsg, 'buffer', {})
+  fs.mkdirSync(MEDIA_DIR, { recursive: true })
+  const safe = String(mediaId || '').replace(/[^A-Za-z0-9_-]/g, '').slice(0, 48) || 'media'
+  const file = path.join(MEDIA_DIR, `${safe}.${extFromMime(mime, mediaType)}`)
+  fs.writeFileSync(file, buf)
+  trimMediaDir()
+  return { file, size: buf.length }
 }
 
 // long-poll waiters
@@ -775,6 +890,14 @@ async function waInitInner() {
       wa.phone = String(sock.user?.id || '').split(':')[0]
       bumpSessionRev('wa linked')
       pushEvent({ type: 'wa.status', platform: 'wa', chat: '', from: 'wa', fromName: 'WhatsApp', text: `connected as +${wa.phone} — linked successfully` })
+      // prime the chat directory with all groups + self chat
+      try {
+        sock.groupFetchAllParticipating().then((gs: any) => {
+          let n = 0
+          for (const id of Object.keys(gs || {})) { upsertWaChat(id, gs[id]?.subject || '', 0); n++ }
+          if (n) pushEvent({ type: 'wa.status', platform: 'wa', chat: '', from: 'wa', fromName: 'WhatsApp', text: `chat directory ready (${waChats.size} chats)` })
+        }).catch(() => { /* not critical */ })
+      } catch { /* not critical */ }
     }
   })
 
@@ -786,15 +909,42 @@ async function waInitInner() {
         const jid = key.remoteJid || ''
         if (!jid || jid === 'status@broadcast') continue
         const c = message.message || {}
+        // chat directory: every message teaches us a chat + a display name
+        upsertWaChat(jid, message.pushName || '', Date.now())
+        if (key.participant) upsertWaChat(key.participant, message.pushName || '', 0)
+        if (key.id) waLastSeenId.set(jid, String(key.id))
+        // ---- media / view-once extraction
+        const med = mediaOf(message)
+        if (med) {
+          const mediaId = String(key.id || '') || ('m' + Date.now())
+          if (med.viewOnce) {
+            // download NOW — before the recipient opens it / before it expires
+            downloadWaMedia(message, mediaId, med.mime, med.mediaType)
+              .then((r) => pushEvent({ type: 'wa.media', platform: 'wa', chat: jid, from: key.participant || jid, fromName: message.pushName || '',
+                text: `[view-once ${med.mediaType}${med.secs ? ` ${med.secs}s` : ''}] ${med.caption}`.trim(),
+                extra: { id: mediaId, fromMe: !!key.fromMe, ts: message.messageTimestamp, mediaId, mime: med.mime, size: r.size, viewOnce: true, mediaType: med.mediaType } }))
+              .catch((e: any) => pushEvent({ type: 'wa.status', platform: 'wa', chat: jid, from: 'wa', fromName: 'WhatsApp', text: `view-once download failed: ${msg(e).slice(0, 140)}` }))
+          } else {
+            // regular media: cache the raw message, pull bytes on demand
+            mediaMsgCache.set(mediaId, message)
+            if (mediaMsgCache.size > MEDIA_CACHE_MAX) {
+              const first = mediaMsgCache.keys().next().value as string
+              mediaMsgCache.delete(first)
+            }
+            pushEvent({ type: 'wa.media', platform: 'wa', chat: jid, from: key.participant || jid, fromName: message.pushName || '',
+              text: `[media ${med.mediaType}${med.secs ? ` ${med.secs}s` : ''}] ${med.caption}`.trim(),
+              extra: { id: mediaId, fromMe: !!key.fromMe, ts: message.messageTimestamp, mediaId, mime: med.mime, size: med.size, viewOnce: false, mediaType: med.mediaType } })
+          }
+          // media messages never fall through to the text path
+          continue
+        }
         const text =
           c.conversation ||
           c.extendedTextMessage?.text ||
-          c.imageMessage?.caption ||
-          c.videoMessage?.caption ||
           c.buttonsResponseMessage?.selectedButtonId ||
           c.listResponseMessage?.singleSelectReply?.selectedRowId ||
           ''
-        if (!text && !key.fromMe) continue // skip empty media-only
+        if (!text && !key.fromMe) continue // skip empty
         pushEvent({
           type: 'wa.message',
           platform: 'wa',
@@ -807,6 +957,11 @@ async function waInitInner() {
       } catch { /* malformed message */ }
     }
   })
+
+  // chat directory feeds (no store needed — we keep our own map)
+  sock.ev.on('chats.set', (u: any) => { for (const ch of u?.chats || []) upsertWaChat(ch.id, ch.name || '', 0) })
+  sock.ev.on('contacts.set', (u: any) => { for (const ct of u?.contacts || []) upsertWaChat(ct.id || ct.jid, ct.name || ct.notify || '', 0) })
+  sock.ev.on('groups.upsert', (gs: any[]) => { for (const g of gs || []) upsertWaChat(g.id, g.subject || '', 0) })
 }
 
 function wipeWaAuth() {
@@ -863,9 +1018,39 @@ async function waRequestPair(opts: { phone?: string; country?: string; pretty?: 
 
 async function waSend(a: any): Promise<any> {
   if (!wa.sock || !wa.connected) throw new Error('whatsapp not connected')
-  const jid = String(a.chat)
+  // lenient chat addressing: bare digits → real JID; chat names → directory lookup
+  let jid = String(a.chat || '')
+  if (jid && !jid.includes('@')) {
+    const bare = jid.replace(/[^0-9]/g, '')
+    if (bare.length >= 8) jid = `${bare}@s.whatsapp.net`
+    else {
+      const hit = [...waChats.values()].find((c) => c.name.toLowerCase() === jid.toLowerCase())
+      if (hit) jid = hit.id
+      else throw new Error(`unknown chat "${a.chat}" — pick a chat from the exe picker or use a JID / phone number`)
+    }
+  }
   if (a.type === 'typing') { await wa.sock.sendPresenceUpdate('composing', jid); return { sent: true } }
-  if (a.type === 'read' && a.messageIds) { await wa.sock.readMessages(a.messageIds.map((id: string) => ({ key: { remoteJid: jid, id } }))); return { sent: true } }
+  if (a.type === 'presence') {
+    const st = String(a.text || 'available')
+    await wa.sock.sendPresenceUpdate(st === 'unavailable' ? 'unavailable' : st === 'composing' ? 'composing' : 'available', jid)
+    return { sent: true }
+  }
+  if (a.type === 'poll' && a.text) {
+    const parts = String(a.text).split('|').map((s: string) => s.trim()).filter(Boolean)
+    const question = parts.shift() || 'poll'
+    if (!parts.length) throw new Error('poll needs options: "question|opt1|opt2"')
+    return await wa.sock.sendMessage(jid, { poll: { name: question, values: parts.slice(0, 12), selectableCount: 1 } })
+  }
+  if (a.type === 'read') {
+    const ids = (Array.isArray(a.messageIds) ? a.messageIds : a.messageId ? [a.messageId] : []).filter(Boolean)
+    if (ids.length) await wa.sock.readMessages(ids.map((id: string) => ({ key: { remoteJid: jid, id } })))
+    else {
+      // mark the whole chat read via an empty read on the newest message we saw
+      const last = waLastSeenId.get(jid)
+      if (last) await wa.sock.readMessages([{ key: { remoteJid: jid, id: last } }])
+    }
+    return { sent: true }
+  }
   if (a.type === 'react' && a.replyTo) {
     return await wa.sock.sendMessage(jid, { react: { text: String(a.text || '👍'), key: { remoteJid: jid, id: a.replyTo, fromMe: false } } })
   }
@@ -1019,6 +1204,7 @@ const server = http.createServer(async (req, res) => {
     sendJson(res, 200, {
       ok: true,
       relay: RELAY_NAME, relayVersion: RELAY_VERSION, uptimeSec: Math.round((Date.now() - startedAt) / 1000),
+      bootId: BOOT_ID,
       telegram: {
         mode: 'user',
         connected: tg.connected,
@@ -1085,6 +1271,49 @@ const server = http.createServer(async (req, res) => {
   }
 
   // ---- qr (both platforms)
+  // ---- chat directory (exe pickers)
+  if (url.pathname === '/api/chats' && req.method === 'GET') {
+    const plat = (url.searchParams.get('platform') || 'all').toLowerCase()
+    const refresh = url.searchParams.get('refresh') === '1'
+    if ((plat === 'tg' || plat === 'all') && tg.authorized && (refresh || Date.now() - tgDialogsAt > 120_000)) {
+      tgDialogsAt = Date.now() // claim BEFORE fetching (avoid parallel storms)
+      await tgFetchDialogs().catch(() => { /* best effort */ })
+    }
+    let list: ChatEntry[] = []
+    if (plat === 'wa' || plat === 'all') list = list.concat([...waChats.values()])
+    if (plat === 'tg' || plat === 'all') list = list.concat(tgDialogs)
+    list.sort((a, b) => (b.ts || 0) - (a.ts || 0))
+    if (list.length > 500) list = list.slice(0, 500)
+    sendJson(res, 200, { ok: true, chats: list, count: list.length, wa: wa.connected, tg: tg.authorized })
+    return
+  }
+
+  // ---- media bytes (view-once saver + manual saves)
+  if (url.pathname.startsWith('/api/media/') && req.method === 'GET') {
+    const mediaId = decodeURIComponent(url.pathname.slice('/api/media/'.length)).replace(/[^A-Za-z0-9_-]/g, '').slice(0, 48)
+    if (!mediaId) { sendJson(res, 400, { ok: false, error: 'media id required' }); return }
+    let file = mediaFile(mediaId)
+    if (!file && mediaMsgCache.has(mediaId)) {
+      // on-demand download for regular (non view-once) media
+      try {
+        const raw = mediaMsgCache.get(mediaId)
+        const med = mediaOf(raw)
+        if (med) { const r = await downloadWaMedia(raw, mediaId, med.mime, med.mediaType); file = r.file }
+      } catch (e: any) { sendJson(res, 502, { ok: false, error: `download failed: ${msg(e).slice(0, 140)}` }); return }
+    }
+    if (!file) { sendJson(res, 404, { ok: false, error: 'media expired (free-tier restart?) — view-once files are only kept briefly' }); return }
+    try {
+      const buf = fs.readFileSync(file)
+      const ext = path.extname(file).slice(1).toLowerCase()
+      const mime = ext === 'jpg' ? 'image/jpeg' : ext === 'png' ? 'image/png' : ext === 'webp' ? 'image/webp'
+        : ext === 'mp4' ? 'video/mp4' : ext === 'webm' ? 'video/webm' : ext === 'ogg' ? 'audio/ogg'
+        : ext === 'mp3' ? 'audio/mpeg' : ext === 'pdf' ? 'application/pdf' : 'application/octet-stream'
+      res.writeHead(200, { 'content-type': mime, 'content-length': buf.length, 'cache-control': 'no-store' })
+      res.end(buf)
+    } catch (e: any) { sendJson(res, 500, { ok: false, error: msg(e) }) }
+    return
+  }
+
   if (url.pathname === '/api/qr' && req.method === 'GET') {
     const plat = url.searchParams.get('platform') || 'wa'
     if (plat === 'tg') {
