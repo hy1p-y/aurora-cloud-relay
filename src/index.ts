@@ -1532,6 +1532,54 @@ const server = http.createServer(async (req, res) => {
     sendJson(res, 200, { ok: true, chats: list, count: list.length, wa: wa.connected, tg: tg.authorized })
     return
   }
+  // ---- contacts (v2.2.4): full account contact book via the usync
+  // "contact" protocol. WhatsApp Web itself uses this exact iq (empty user
+  // list, context=contact, mode=query) when a linked device asks the server
+  // for the phone's synced contact book; we return the raw nodes so the exe
+  // picker can show every saved contact with names.
+  if (url.pathname === '/api/contacts' && req.method === 'GET') {
+    if (!wa.sock || !wa.connected) { sendJson(res, 502, { ok: false, error: 'whatsapp not connected' }); return }
+    const out: any = { ok: true, directory: waChats.size }
+    const rawNodeToObj = (nd: any): any => {
+      if (!nd) return null
+      const o: any = { tag: nd.tag, attrs: nd.attrs || {} }
+      if (Array.isArray(nd.content)) o.content = nd.content.map(rawNodeToObj)
+      else if (nd.content != null) o.content = String(nd.content)
+      return o
+    }
+    // probe A: Baileys executeUSyncQuery with a custom raw-capturing protocol
+    try {
+      const baileys: any = await import('@whiskeysockets/baileys')
+      const probe = {
+        name: 'contact',
+        getQueryElement: () => ({ tag: 'contact', attrs: {} }),
+        getUserElement: () => ({ tag: 'contact', attrs: {} }),
+        parser: (node: any) => rawNodeToObj(node),
+      }
+      const q = new baileys.USyncQuery().withContext('contact').withMode('query')
+      q.protocols.push(probe)
+      const r = await wa.sock.executeUSyncQuery(q)
+      out.usyncCount = r?.list?.length ?? 0
+      out.usync = (r?.list ?? []).slice(0, 300)
+    } catch (e: any) { out.usyncError = msg(e) }
+    // probe B: hand-rolled iq without the empty list node
+    try {
+      const tag = (Date.now() % 100000).toString(16)
+      const iq: any = {
+        tag: 'iq',
+        attrs: { to: 's.whatsapp.net', type: 'get', xmlns: 'usync', id: 'uc' + tag },
+        content: [{
+          tag: 'usync',
+          attrs: { context: 'contact', mode: 'query', sid: 'us' + tag, last: 'true', index: '0' },
+          content: [{ tag: 'query', attrs: {}, content: [{ tag: 'contact', attrs: {} }] }],
+        }],
+      }
+      const rr = await wa.sock.query(iq)
+      out.rawIq = rawNodeToObj(rr)
+    } catch (e: any) { out.rawIqError = msg(e) }
+    sendJson(res, 200, out)
+    return
+  }
 
   // ---- media bytes (view-once saver + manual saves)
   if (url.pathname.startsWith('/api/media/') && req.method === 'GET') {
