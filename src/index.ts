@@ -1,23 +1,23 @@
 /**
- * Aurora Cloud Relay v2 - server-only bridge between the VANTA desktop exe
+ * Aurora Cloud Relay v2 — server-only bridge between the VANTA desktop exe
  * and YOUR OWN Telegram account (MTProto userbot via GramJS) + WhatsApp
  * (Baileys). Deploy on a free always-on host (Render / Koyeb / Railway /
  * Fly.io / HF Spaces). It holds the platform connections open 24/7, queues
  * incoming messages, relays actions from the desktop exe, and keeps session
  * backups the exe can restore after free-tier restarts.
  *
- * Telegram runs as the USER'S OWN ACCOUNT (userbot) - no BotFather bot.
+ * Telegram runs as the USER'S OWN ACCOUNT (userbot) — no BotFather bot.
  * WhatsApp links by QR code OR 8-digit phone pairing code.
  *
- * v2.2.1 - "couldn't link device" + unreadable QR fixes:
+ * v2.2.1 — "couldn't link device" + unreadable QR fixes:
  *   - requestPairingCode is no longer fired on the same tick as the QR event
- *     (2.5s delay - same-tick calls yield codes the phone rejects with
+ *     (2.5s delay — same-tick calls yield codes the phone rejects with
  *     "couldn't link device, check the phone number").
- *   - pairing codes now AUTO-REFRESH every ~100s on a live socket - WhatsApp
+ *   - pairing codes now AUTO-REFRESH every ~100s on a live socket — WhatsApp
  *     kills codes after ~2-3 min, and every previously shown code was already
  *     dead by the time the user typed it in.
  *   - re-clicking "pair by code" with the same number no longer restarts the
- *     socket (which killed the code being typed) - a still-fresh code is
+ *     socket (which killed the code being typed) — a still-fresh code is
  *     simply re-shown.
  *   - phone-mode pairing never serves a QR matrix anymore (the exe shows the
  *     code card + the number the code was issued for).
@@ -25,18 +25,18 @@
  *     and NO overlay drawn on the modules (the old translucent shimmer band
  *     made the code unscannable).
  *
- * v2.1.0 - pairing hardening:
- *   - phone numbers are normalized with libphonenumber (accepts +98., 0098.,
- *     98., and local 0917. when a country is selected; trunk zeros after the
- *     country code are stripped) - Baileys needs bare digits or it builds an
+ * v2.1.0 — pairing hardening:
+ *   - phone numbers are normalized with libphonenumber (accepts +98…, 0098…,
+ *     98…, and local 0917… when a country is selected; trunk zeros after the
+ *     country code are stripped) — Baileys needs bare digits or it builds an
  *     invalid JID and the phone rejects the code with "wrong number/code".
  *   - a device that WhatsApp invalidates ("logged out / device removed") now
- *     wipes the stale noise keys and restarts pairing automatically - stale
+ *     wipes the stale noise keys and restarts pairing automatically — stale
  *     creds used to poison every reconnect forever.
  *   - pairing codes die when the socket reconnects; a fresh code is now
  *     requested automatically and the exe is told the old one expired.
  *   - pairing requests are single-flight + debounced (double clicks used to
- *     spawn two sockets on one auth folder  conflict  instant logout).
+ *     spawn two sockets on one auth folder → conflict → instant logout).
  *   - session backups only contain a WhatsApp blob once the account is really
  *     linked, so the exe can never restore a dead/poisoned session.
  *
@@ -73,7 +73,7 @@ function loadToken(): string {
 }
 const TOKEN = loadToken()
 const startedAt = Date.now()
-// relay boot identity - the exe uses it to detect restarts and reset its
+// relay boot identity — the exe uses it to detect restarts and reset its
 // event cursor (buffered events die with the process, so seq numbers reset)
 const BOOT_ID = crypto.randomUUID().slice(0, 13)
 
@@ -213,7 +213,7 @@ async function tgFetchDialogs() {
 }
 
 // ============================================== MEDIA PIPELINE (view-once!)
-// WhatsApp view-once media must be downloaded the instant it arrives -
+// WhatsApp view-once media must be downloaded the instant it arrives —
 // before the recipient opens it (and before any free-tier restart wipes it).
 // The file lands in DATA_DIR/media and the exe pulls it via /api/media/:id.
 const MEDIA_DIR = path.join(DATA_DIR, 'media')
@@ -295,7 +295,7 @@ function unwrapMessage(msg: any): { inner: any; isViewOnce: boolean } {
   return { inner: content || {}, isViewOnce }
 }
 
-// message  { raw, mediaType, mime, size, viewOnce, caption, secs } or null
+// message → { raw, mediaType, mime, size, viewOnce, caption, secs } or null
 function mediaOf(message: any) {
   const { inner, isViewOnce } = unwrapMessage(message)
   const holders: Array<[string, string]> = [
@@ -448,7 +448,7 @@ async function qrMatrix(text: string): Promise<number[][]> {
 }
 
 // ------------------------------------------------- phone normalization (WA)
-// Baileys' requestPairingCode builds `<phone>@s.whatsapp.net` VERBATIM - a
+// Baileys' requestPairingCode builds `<phone>@s.whatsapp.net` VERBATIM — a
 // leading +, a 00 prefix or a trunk zero after the country code produces an
 // invalid JID, WhatsApp issues the code for a number that does not exist and
 // the phone then rejects it ("wrong number/code"). Normalize here, always.
@@ -467,9 +467,9 @@ async function normalizeWaPhone(raw: string, country?: string): Promise<NormPhon
   const lp = await getLibphone()
   const cc = (country || '').toUpperCase()
   let pn: any = null
-  // 1) international (+. or plain digits that already carry the country code)
+  // 1) international (+… or plain digits that already carry the country code)
   try { if (lp) pn = lp.parsePhoneNumberFromString(cleaned) } catch { /* try more */ }
-  // 2) trunk-zero fix: +98 0917.  +98 917. (classic mistake libphonenumber may not auto-fix)
+  // 2) trunk-zero fix: +98 0917… → +98 917… (classic mistake libphonenumber may not auto-fix)
   if ((!pn || !pn.isValid()) && cleaned.startsWith('+') && lp) {
     const body = cleaned.slice(1)
     for (const cut of [1, 2, 3]) {
@@ -482,7 +482,7 @@ async function normalizeWaPhone(raw: string, country?: string): Promise<NormPhon
       }
     }
   }
-  // 3) local format (0917.) with the country picked in the exe
+  // 3) local format (0917…) with the country picked in the exe
   if ((!pn || !pn.isValid()) && cc && lp) {
     try { pn = lp.parsePhoneNumberFromString(cleaned, cc) } catch { /* fallthrough */ }
   }
@@ -490,20 +490,20 @@ async function normalizeWaPhone(raw: string, country?: string): Promise<NormPhon
     return { ok: true, digits: String(pn.number).replace(/^\+/, ''), pretty: pn.formatInternational() }
   }
   // last resort: bare digits sanity (10-15) so we never regress below old behavior.
-  // A leading 0 can never be part of an E.164 number - that's a local format.
+  // A leading 0 can never be part of an E.164 number — that's a local format.
   const digits = cleaned.replace(/^\+/, '').replace(/\D/g, '')
   if (digits.startsWith('0')) {
-    return { ok: false, err: 'this looks like a local number (starts with 0) - include the country code (e.g. +98 917 123 4567) or pick your country next to the input' }
+    return { ok: false, err: 'this looks like a local number (starts with 0) — include the country code (e.g. +98 917 123 4567) or pick your country next to the input' }
   }
   if (digits.length >= 10 && digits.length <= 15) {
     return { ok: true, digits, pretty: '+' + digits }
   }
-  return { ok: false, err: `not a valid WhatsApp number - use the full international format, e.g. +98 917 123 4567${cc ? ` (or a local number with ${cc} selected)` : ''}` }
+  return { ok: false, err: `not a valid WhatsApp number — use the full international format, e.g. +98 917 123 4567${cc ? ` (or a local number with ${cc} selected)` : ''}` }
 }
 
 // ------------------------------------------------------------- session rev
 // rev increments whenever session data is written. The exe watches it and
-// re-exports the session blob to its own disk - that's how sessions survive
+// re-exports the session blob to its own disk — that's how sessions survive
 // free-tier restarts (Render wipes DATA_DIR on redeploy/sleep).
 let sessionRev = 1
 let lastCredsBump = 0
@@ -590,7 +590,7 @@ async function tgAfterAuth() {
   tg.qrOn = false
   tg.qr = null
   tg.self = await tgSelfInfo()
-  pushEvent({ type: 'tg.status', platform: 'tg', chat: '', from: 'tg', fromName: 'Telegram', text: `logged in as ${tgSelfLabel()} - modules now run on your account` })
+  pushEvent({ type: 'tg.status', platform: 'tg', chat: '', from: 'tg', fromName: 'Telegram', text: `logged in as ${tgSelfLabel()} — modules now run on your account` })
 }
 
 async function peerName(id: string): Promise<string> {
@@ -657,7 +657,7 @@ async function tgSupervisor() {
         })
         try { tg.client.setParseMode(undefined) } catch { /* older gramjs */ }
         attachTgHandlers(tg.client)
-        pushEvent({ type: 'tg.status', platform: 'tg', chat: '', from: 'tg', fromName: 'Telegram', text: saved ? 'restoring saved session...' : 'no session - waiting for login (phone code or QR)' })
+        pushEvent({ type: 'tg.status', platform: 'tg', chat: '', from: 'tg', fromName: 'Telegram', text: saved ? 'restoring saved session...' : 'no session — waiting for login (phone code or QR)' })
       }
       if (!tg.client.connected) await tg.client.connect()
       tg.connected = true
@@ -671,7 +671,7 @@ async function tgSupervisor() {
           tg.authorized = false
           tg.self = null
           tg.stage = 'idle'
-          pushEvent({ type: 'tg.status', platform: 'tg', chat: '', from: 'tg', fromName: 'Telegram', text: 'session no longer authorized - log in again' })
+          pushEvent({ type: 'tg.status', platform: 'tg', chat: '', from: 'tg', fromName: 'Telegram', text: 'session no longer authorized — log in again' })
           try { await tg.client.disconnect() } catch { /* noop */ }
           tg.client = null
         }
@@ -688,7 +688,7 @@ async function tgSupervisor() {
         tg.self = null
         tg.stage = 'idle'
         fs.rmSync(TG_SESSION_FILE(), { force: true })
-        pushEvent({ type: 'tg.status', platform: 'tg', chat: '', from: 'tg', fromName: 'Telegram', text: 'session invalid - cleared, log in again' })
+        pushEvent({ type: 'tg.status', platform: 'tg', chat: '', from: 'tg', fromName: 'Telegram', text: 'session invalid — cleared, log in again' })
       } else if (!/already connected|disconnect/i.test(s)) {
         pushEvent({ type: 'tg.status', platform: 'tg', chat: '', from: 'tg', fromName: 'Telegram', text: `connection error: ${s.slice(0, 160)}` })
       }
@@ -702,8 +702,8 @@ async function tgSupervisor() {
 async function tgLoginPhone(phoneRaw: string) {
   phoneRaw = String(phoneRaw || '').replace(/[\s\-()]/g, '')
   if (!phoneRaw) throw new Error('phone required (international format, e.g. +989123456789)')
-  if (!tg.client || !tg.client.connected) throw new Error('telegram not connected - save api id/hash first')
-  if (tg.authorized) throw new Error('already logged in - logout first')
+  if (!tg.client || !tg.client.connected) throw new Error('telegram not connected — save api id/hash first')
+  if (tg.authorized) throw new Error('already logged in — logout first')
   if (tg.loginBusy) throw new Error('another login step is running, wait a moment')
   tg.loginBusy = true
   try {
@@ -720,7 +720,7 @@ async function tgLoginPhone(phoneRaw: string) {
 }
 
 async function tgLoginCode(code: string) {
-  if (tg.stage !== 'code' || !tg.phoneCodeHash) throw new Error('no code was requested - send code first')
+  if (tg.stage !== 'code' || !tg.phoneCodeHash) throw new Error('no code was requested — send code first')
   if (tg.authorized) return { stage: 'ok' }
   if (tg.loginBusy) throw new Error('another login step is running, wait a moment')
   tg.loginBusy = true
@@ -855,10 +855,10 @@ async function tgSend(a: any): Promise<any> {
       try {
         await tg.client.invoke(new Api.messages.SendReaction({
           peer: chat, msgId: mid,
-          reaction: [new Api.ReactionEmoji({ emoticon: String(a.text || '??') })],
+          reaction: [new Api.ReactionEmoji({ emoticon: String(a.text || '👍') })],
         }))
         return { reacted: true }
-      } catch { /* older layer - fall through to text */ }
+      } catch { /* older layer — fall through to text */ }
     }
   }
   // plain send (as the user)
@@ -874,14 +874,14 @@ const wa = {
   pairing: false,
   pairingCode: '',
   pairPhone: '',           // normalized digits for the pairing-code flow
-  pairPhonePretty: '',     // "+98 917 ." for display in the exe
+  pairPhonePretty: '',     // "+98 917 …" for display in the exe
   pairingCodeAsked: false, // requested once per socket generation
   pairingCodeAt: 0,        // when the current code was issued
   pairBusy: false,         // a requestPairingCode call is scheduled / in flight
   err: '',
   sock: null as any,
   qr: null as { matrix: number[][]; text: string; at: number; gen: number } | null,
-  gen: 0,                  // socket generation - exe uses it to drop stale QRs
+  gen: 0,                  // socket generation — exe uses it to drop stale QRs
   attempts: 0,
   initBusy: false,         // single-flight guard: never two sockets on one auth folder
   lastPairReqAt: 0,        // debounce for repeated pair requests
@@ -957,7 +957,7 @@ async function waInitInner() {
     if (qr) {
       if (wa.gen !== myGen) return // stale socket event
       wa.pairing = true
-      // pairing-code flow takes precedence over QR - in this mode NO matrix
+      // pairing-code flow takes precedence over QR — in this mode NO matrix
       // is ever served (the exe shows the code card only)
       if (wa.pairPhone) {
         if (!wa.pairingCodeAsked && !wa.pairBusy) {
@@ -985,7 +985,7 @@ async function waInitInner() {
       const matrix = await qrMatrix(qr)
       if (wa.gen === myGen) {
         wa.qr = { matrix, text: qr, at: Date.now(), gen: myGen }
-        pushEvent({ type: 'wa.status', platform: 'wa', chat: '', from: 'wa', fromName: 'WhatsApp', text: 'QR ready - scan from the exe (Cloud tab)' })
+        pushEvent({ type: 'wa.status', platform: 'wa', chat: '', from: 'wa', fromName: 'WhatsApp', text: 'QR ready — scan from the exe (Cloud tab)' })
       }
     }
     if (connection === 'close') {
@@ -1009,20 +1009,20 @@ async function waInitInner() {
         wa.attempts = 0
         wa.pairing = !!wa.pairPhone // phone pairing resumes automatically
         bumpSessionRev('wa device reset')
-        pushEvent({ type: 'wa.status', platform: 'wa', chat: '', from: 'wa', fromName: 'WhatsApp', text: 'device was removed from the account - session keys reset, restarting pairing' })
+        pushEvent({ type: 'wa.status', platform: 'wa', chat: '', from: 'wa', fromName: 'WhatsApp', text: 'device was removed from the account — session keys reset, restarting pairing' })
         setTimeout(() => waInit().catch(() => { /* logged */ }), 1500)
         return
       }
-      // a plain reconnect invalidates any issued pairing code - say so and
+      // a plain reconnect invalidates any issued pairing code — say so and
       // let the new socket request a fresh one automatically
       wa.pairBusy = false
       if (wa.pairingCode) {
         wa.pairingCode = ''
-        pushEvent({ type: 'wa.status', platform: 'wa', chat: '', from: 'wa', fromName: 'WhatsApp', text: 'pairing code expired (connection restarted) - a fresh code will appear automatically' })
+        pushEvent({ type: 'wa.status', platform: 'wa', chat: '', from: 'wa', fromName: 'WhatsApp', text: 'pairing code expired (connection restarted) — a fresh code will appear automatically' })
       }
       wa.attempts++
       const delay = Math.min(3000 * wa.attempts, 15000)
-      pushEvent({ type: 'wa.status', platform: 'wa', chat: '', from: 'wa', fromName: 'WhatsApp', text: `connection closed (${code}) - reconnect #${wa.attempts} in ${Math.round(delay / 1000)}s` })
+      pushEvent({ type: 'wa.status', platform: 'wa', chat: '', from: 'wa', fromName: 'WhatsApp', text: `connection closed (${code}) — reconnect #${wa.attempts} in ${Math.round(delay / 1000)}s` })
       if (wa.attempts <= 12) {
         await sleep(delay)
         if (wa.gen === myGen) {
@@ -1045,7 +1045,7 @@ async function waInitInner() {
       wa.err = ''
       wa.phone = String(sock.user?.id || '').split(':')[0]
       bumpSessionRev('wa linked')
-      pushEvent({ type: 'wa.status', platform: 'wa', chat: '', from: 'wa', fromName: 'WhatsApp', text: `connected as +${wa.phone} - linked successfully` })
+      pushEvent({ type: 'wa.status', platform: 'wa', chat: '', from: 'wa', fromName: 'WhatsApp', text: `connected as +${wa.phone} — linked successfully` })
       // prime the chat directory with all groups and group participants
       try {
         sock.groupFetchAllParticipating().then((gs: any) => {
@@ -1103,7 +1103,7 @@ async function waInitInner() {
         if (med) {
           const mediaId = String(key.id || '') || ('m' + Date.now())
           if (med.viewOnce) {
-            // download NOW - before the recipient opens it / before it expires
+            // download NOW — before the recipient opens it / before it expires
             downloadWaMedia(med.raw, mediaId, med.mime, med.mediaType)
               .then((r) => pushEvent({ type: 'wa.media', platform: 'wa', chat: jid, from: key.participant || jid, fromName: message.pushName || '',
                 text: `[view-once ${med.mediaType}${med.secs ? ` ${med.secs}s` : ''}] ${med.caption}`.trim(),
@@ -1183,7 +1183,7 @@ function wipeWaAuth() {
 // (re)start WhatsApp linking: QR flow, or pairing-code when a phone is given.
 // Single-flight + debounced + always validated + always fresh keys.
 async function waRequestPair(opts: { phone?: string; country?: string; pretty?: string } = {}) {
-  // validate FIRST - bad input must never kill a running pairing session
+  // validate FIRST — bad input must never kill a running pairing session
   let phone = '', pretty = opts.pretty || ''
   if (opts.phone) {
     const norm = await normalizeWaPhone(opts.phone, opts.country)
@@ -1199,7 +1199,7 @@ async function waRequestPair(opts: { phone?: string; country?: string; pretty?: 
   wa.lastPairReqAt = Date.now()
   wa.lastPairReqKey = key
 
-  // same number + still-fresh code + live pairing session  just re-show the
+  // same number + still-fresh code + live pairing session → just re-show the
   // current code. Restarting the socket here would kill a code the user may
   // be entering on their phone RIGHT NOW ("couldn't link device" on their end).
   if (
@@ -1207,18 +1207,18 @@ async function waRequestPair(opts: { phone?: string; country?: string; pretty?: 
     wa.pairingCodeAt && Date.now() - wa.pairingCodeAt < 90_000 &&
     !wa.connected && wa.pairing
   ) {
-    pushEvent({ type: 'wa.status', platform: 'wa', chat: '', from: 'wa', fromName: 'WhatsApp', text: `pairing code for ${pretty || phone}: ${wa.pairingCode} (still valid - no restart needed)` })
+    pushEvent({ type: 'wa.status', platform: 'wa', chat: '', from: 'wa', fromName: 'WhatsApp', text: `pairing code for ${pretty || phone}: ${wa.pairingCode} (still valid — no restart needed)` })
     return
   }
 
-  if (wa.initBusy) throw new Error('pairing is already starting - wait a few seconds')
-  if (wa.connected) throw new Error(`already linked as +${wa.phone} - log out first to pair again`)
+  if (wa.initBusy) throw new Error('pairing is already starting — wait a few seconds')
+  if (wa.connected) throw new Error(`already linked as +${wa.phone} — log out first to pair again`)
   wa.initBusy = true
   try {
     try { await wa.sock?.end?.(undefined) } catch { /* noop */ }
     wa.sock = null
     wa.gen++
-    wipeWaAuth() // fresh noise identity per attempt - stale keys poison reconnects
+    wipeWaAuth() // fresh noise identity per attempt — stale keys poison reconnects
     wa.qr = null
     wa.pairingCode = ''
     wa.pairingCodeAsked = false
@@ -1234,7 +1234,7 @@ async function waRequestPair(opts: { phone?: string; country?: string; pretty?: 
     bumpSessionRev('wa pair start')
     await sleep(400)
     await waInit({ force: true })
-    pushEvent({ type: 'wa.status', platform: 'wa', chat: '', from: 'wa', fromName: 'WhatsApp', text: phone ? `requesting pairing code for ${pretty || phone}.` : 'new QR requested' })
+    pushEvent({ type: 'wa.status', platform: 'wa', chat: '', from: 'wa', fromName: 'WhatsApp', text: phone ? `requesting pairing code for ${pretty || phone}…` : 'new QR requested' })
   } finally {
     wa.initBusy = false
   }
@@ -1242,7 +1242,7 @@ async function waRequestPair(opts: { phone?: string; country?: string; pretty?: 
 
 async function waSend(a: any): Promise<any> {
   if (!wa.sock || !wa.connected) throw new Error('whatsapp not connected')
-  // lenient chat addressing: bare digits  real JID; chat names  directory lookup
+  // lenient chat addressing: bare digits → real JID; chat names → directory lookup
   let jid = String(a.chat || '')
   if (jid && !jid.includes('@')) {
     const bare = jid.replace(/[^0-9]/g, '')
@@ -1250,7 +1250,7 @@ async function waSend(a: any): Promise<any> {
     else {
       const hit = [...waChats.values()].find((c) => c.name.toLowerCase() === jid.toLowerCase())
       if (hit) jid = hit.id
-      else throw new Error(`unknown chat "${a.chat}" - pick a chat from the exe picker or use a JID / phone number`)
+      else throw new Error(`unknown chat "${a.chat}" — pick a chat from the exe picker or use a JID / phone number`)
     }
   }
   if (a.type === 'status' || jid === 'status@broadcast') {
@@ -1279,7 +1279,7 @@ async function waSend(a: any): Promise<any> {
     return { sent: true }
   }
   if (a.type === 'react' && a.replyTo) {
-    return await wa.sock.sendMessage(jid, { react: { text: String(a.text || '??'), key: { remoteJid: jid, id: a.replyTo, fromMe: false } } })
+    return await wa.sock.sendMessage(jid, { react: { text: String(a.text || '👍'), key: { remoteJid: jid, id: a.replyTo, fromMe: false } } })
   }
   return await wa.sock.sendMessage(jid, { text: String(a.text || '') })
 }
@@ -1301,14 +1301,14 @@ async function waLogout() {
   wa.pairingCodeAt = 0
   wa.qr = null
   bumpSessionRev('wa logout')
-  pushEvent({ type: 'wa.status', platform: 'wa', chat: '', from: 'wa', fromName: 'WhatsApp', text: 'session cleared - request new pairing' })
+  pushEvent({ type: 'wa.status', platform: 'wa', chat: '', from: 'wa', fromName: 'WhatsApp', text: 'session cleared — request new pairing' })
 }
 
 // ============================================== SESSION BACKUP (blob import/export)
 function buildSessionExport() {
   const tgS = fs.existsSync(TG_SESSION_FILE()) ? fs.readFileSync(TG_SESSION_FILE(), 'utf8').trim() : ''
   const waFiles: Record<string, string> = {}
-  if (wa.connected) { // ONLY export a really-linked session - never poison the exe backup
+  if (wa.connected) { // ONLY export a really-linked session — never poison the exe backup
     const dir = path.join(DATA_DIR, 'wa-auth')
     try {
       for (const f of fs.readdirSync(dir)) {
@@ -1337,7 +1337,7 @@ async function sessionImport(body: any): Promise<string[]> {
     const obj = JSON.parse(zlib.gunzipSync(Buffer.from(body.wa, 'base64')).toString('utf8'))
     if (obj?.wa && typeof obj.wa === 'object') {
       if (obj.waOk !== true) {
-        // v3 guard: this blob was exported from an unlinked/stale session -
+        // v3 guard: this blob was exported from an unlinked/stale session —
         // restoring it would poison the relay forever. Skip it.
         pushEvent({ type: 'wa.status', platform: 'wa', chat: '', from: 'wa', fromName: 'WhatsApp', text: 'skipped stale whatsapp backup (not linked when exported)' })
       } else {
@@ -1397,15 +1397,15 @@ h1{font-size:18px;margin:0 0 4px;color:#7ee0a3}small{color:#68738a}
 code{background:#1a2030;padding:2px 8px;border-radius:6px;user-select:all}
 .m{color:#68738a}
 </style></head><body>
-<div class="card"><h1>? ${esc(RELAY_NAME)}</h1><small>v${RELAY_VERSION} � up ${Math.round((Date.now() - startedAt) / 1000)}s � ${agentConnected() ? '<span class="ok">VANTA.exe CONNECTED</span>' : '<span class="warn">exe offline (messages are queueing)</span>'}</small>
+<div class="card"><h1>⚡ ${esc(RELAY_NAME)}</h1><small>v${RELAY_VERSION} · up ${Math.round((Date.now() - startedAt) / 1000)}s · ${agentConnected() ? '<span class="ok">VANTA.exe CONNECTED</span>' : '<span class="warn">exe offline (messages are queueing)</span>'}</small>
 <div class="grid">
 <span class="pill">Telegram <span class="${tg.authorized ? 'ok' : 'warn'}">${esc(tgLabel)}</span></span>
 <span class="pill">WhatsApp ${wa.connected ? `<span class="ok">${esc(wa.phone)}</span>` : wa.pairing ? `<span class="warn">pairing${wa.pairPhonePretty ? ' ' + esc(wa.pairPhonePretty) : ''}</span>` : '<span class="warn">disconnected</span>'}</span>
-<span class="pill">sessions rev ${sessionRev}${tg.authorized ? ' � tg�' : ''}${waCredsPresent() ? ' � wa�' : ''}</span>
+<span class="pill">sessions rev ${sessionRev}${tg.authorized ? ' · tg✓' : ''}${waCredsPresent() ? ' · wa✓' : ''}</span>
 <span class="pill">events ${events.length}/${MAX_EVENTS}${droppedEvents ? ` (dropped ${droppedEvents})` : ''}</span>
-<span class="pill">actions ${actionsTotal}${actionsFailed ? ` � failed ${actionsFailed}` : ''} � ${actionTimes.length}/min</span>
+<span class="pill">actions ${actionsTotal}${actionsFailed ? ` · failed ${actionsFailed}` : ''} · ${actionTimes.length}/min</span>
 </div>
-<div style="margin-top:14px;color:#68738a">Telegram runs as <b>your own account</b> (userbot). Link it from the VANTA desktop app: Cloud tab  Telegram. WhatsApp pairs by QR or 8-digit code from the same tab. All API routes require the auth token.</div></div>
+<div style="margin-top:14px;color:#68738a">Telegram runs as <b>your own account</b> (userbot). Link it from the VANTA desktop app: Cloud tab → Telegram. WhatsApp pairs by QR or 8-digit code from the same tab. All API routes require the auth token.</div></div>
 <div class="card"><b>Relay Activity</b><div style="margin-top:8px;color:#68738a">Message traffic, QR codes and login flows are token-gated. Connect the VANTA desktop client to pair accounts and view live events.</div></div>
 </body></html>`
 }
@@ -1548,7 +1548,7 @@ const server = http.createServer(async (req, res) => {
         }
       } catch (e: any) { sendJson(res, 502, { ok: false, error: `download failed: ${msg(e).slice(0, 140)}` }); return }
     }
-    if (!file) { sendJson(res, 404, { ok: false, error: 'media expired (free-tier restart?) - view-once files are only kept briefly' }); return }
+    if (!file) { sendJson(res, 404, { ok: false, error: 'media expired (free-tier restart?) — view-once files are only kept briefly' }); return }
     try {
       const buf = fs.readFileSync(file)
       const ext = path.extname(file).slice(1).toLowerCase()
@@ -1618,7 +1618,7 @@ const server = http.createServer(async (req, res) => {
         sendJson(res, 200, { ok: true, ...r })
       } else if (step === 'qr-start') {
         if (tg.authorized) throw new Error('already logged in')
-        if (!tg.client || !tg.client.connected) throw new Error('telegram not connected - save api id/hash first')
+        if (!tg.client || !tg.client.connected) throw new Error('telegram not connected — save api id/hash first')
         tg.qrOn = true
         tg.stage = 'qr'
         tg.qr = null
@@ -1655,7 +1655,7 @@ const server = http.createServer(async (req, res) => {
         tg.apiHash = newHash
         saveRelayCfg()
         changed.push('tgApi')
-        pushEvent({ type: 'tg.status', platform: 'tg', chat: '', from: 'tg', fromName: 'Telegram', text: `api credentials set (id ${newId}) - ready for login` })
+        pushEvent({ type: 'tg.status', platform: 'tg', chat: '', from: 'tg', fromName: 'Telegram', text: `api credentials set (id ${newId}) — ready for login` })
       } else if (!newId || !newHash) {
         changed.push('tgApiInvalid')
       }
@@ -1705,16 +1705,16 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log(`[relay] ${RELAY_NAME} v${RELAY_VERSION} listening on 0.0.0.0:${PORT}`)
   console.log(`[relay] status page: http://localhost:${PORT}/`)
   console.log(`[relay] AUTH_TOKEN: ${TOKEN}`)
-  pushEvent({ type: 'sys.log', platform: 'sys', chat: '', from: 'relay', fromName: 'Relay', text: `Aurora Cloud Relay v${RELAY_VERSION} booted (telegram userbot + whatsapp � pairing hardening)` })
+  pushEvent({ type: 'sys.log', platform: 'sys', chat: '', from: 'relay', fromName: 'Relay', text: `Aurora Cloud Relay v${RELAY_VERSION} booted (telegram userbot + whatsapp · pairing hardening)` })
   loadWaChats()
   loadRelayCfg()
   if (tg.apiId && tg.apiHash) {
-    pushEvent({ type: 'tg.status', platform: 'tg', chat: '', from: 'tg', fromName: 'Telegram', text: `api credentials present (id ${tg.apiId}) - starting userbot` })
+    pushEvent({ type: 'tg.status', platform: 'tg', chat: '', from: 'tg', fromName: 'Telegram', text: `api credentials present (id ${tg.apiId}) — starting userbot` })
   } else {
-    pushEvent({ type: 'tg.status', platform: 'tg', chat: '', from: 'tg', fromName: 'Telegram', text: 'no api credentials - set them from the exe (Cloud tab  Telegram  save keys)' })
+    pushEvent({ type: 'tg.status', platform: 'tg', chat: '', from: 'tg', fromName: 'Telegram', text: 'no api credentials — set them from the exe (Cloud tab → Telegram → save keys)' })
   }
   if (process.env.TELEGRAM_BOT_TOKEN) {
-    pushEvent({ type: 'sys.log', platform: 'sys', chat: '', from: 'relay', fromName: 'Relay', text: 'note: TELEGRAM_BOT_TOKEN is ignored - this relay runs Telegram as the user account (userbot)' })
+    pushEvent({ type: 'sys.log', platform: 'sys', chat: '', from: 'relay', fromName: 'Relay', text: 'note: TELEGRAM_BOT_TOKEN is ignored — this relay runs Telegram as the user account (userbot)' })
   }
   tgSupervisor().catch(() => { /* logged in loop */ })
   waInit().catch((e) => pushEvent({ type: 'wa.status', platform: 'wa', chat: '', from: 'wa', fromName: 'WhatsApp', text: `init failed: ${msg(e)}` }))
@@ -1745,7 +1745,7 @@ process.on('unhandledRejection', (reason) => {
 // graceful shutdown keeps WA session files consistent
 for (const sig of ['SIGINT', 'SIGTERM'] as const) {
   process.on(sig, async () => {
-    console.log(`[relay] ${sig} - shutting down`)
+    console.log(`[relay] ${sig} — shutting down`)
     try { await wa.sock?.end?.(undefined) } catch { /* noop */ }
     try { await tg.client?.disconnect?.() } catch { /* noop */ }
     process.exit(0)
