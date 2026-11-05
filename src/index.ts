@@ -1532,6 +1532,11 @@ const server = http.createServer(async (req, res) => {
     sendJson(res, 200, { ok: true, chats: list, count: list.length, wa: wa.connected, tg: tg.authorized })
     return
   }
+  // ---- helpers used by the contacts probe (must answer even if the WA
+  // server ignores a malformed-ish usync iq - never leave an HTTP handler hanging)
+  const withTimeout = (p: any, ms: number, tag: string): Promise<any> =>
+    Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error(tag + ' timeout after ' + ms + 'ms')), ms))])
+
   // ---- contacts (v2.2.4): full account contact book via the usync
   // "contact" protocol. WhatsApp Web itself uses this exact iq (empty user
   // list, context=contact, mode=query) when a linked device asks the server
@@ -1558,7 +1563,7 @@ const server = http.createServer(async (req, res) => {
       }
       const q = new baileys.USyncQuery().withContext('contact').withMode('query')
       q.protocols.push(probe)
-      const r = await wa.sock.executeUSyncQuery(q)
+      const r = await withTimeout(wa.sock.executeUSyncQuery(q), 12000, 'usync-query')
       out.usyncCount = r?.list?.length ?? 0
       out.usync = (r?.list ?? []).slice(0, 300)
     } catch (e: any) { out.usyncError = msg(e) }
@@ -1574,7 +1579,7 @@ const server = http.createServer(async (req, res) => {
           content: [{ tag: 'query', attrs: {}, content: [{ tag: 'contact', attrs: {} }] }],
         }],
       }
-      const rr = await wa.sock.query(iq)
+      const rr = await withTimeout(wa.sock.query(iq), 12000, 'raw-iq')
       out.rawIq = rawNodeToObj(rr)
     } catch (e: any) { out.rawIqError = msg(e) }
     sendJson(res, 200, out)
