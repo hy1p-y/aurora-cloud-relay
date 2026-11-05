@@ -1,0 +1,16 @@
+# Render blueprint — deploy with "New → Blueprint" and pick this repo.
+# https://render.com/docs/blueprint-spec
+services:
+  - type: web
+    name: aurora-cloud-relay
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /health
+    envVars:
+      - key: AUTH_TOKEN
+        sync: false
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: RELAY_NAME
+        value: Aurora Cloud Relay
