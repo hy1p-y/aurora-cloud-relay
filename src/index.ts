@@ -9,6 +9,21 @@
  * Telegram runs as the USER'S OWN ACCOUNT (userbot) — no BotFather bot.
  * WhatsApp links by QR code OR 8-digit phone pairing code.
  *
+ * v2.1.0 — pairing hardening:
+ *   - phone numbers are normalized with libphonenumber (accepts +98…, 0098…,
+ *     98…, and local 0917… when a country is selected; trunk zeros after the
+ *     country code are stripped) — Baileys needs bare digits or it builds an
+ *     invalid JID and the phone rejects the code with "wrong number/code".
+ *   - a device that WhatsApp invalidates ("logged out / device removed") now
+ *     wipes the stale noise keys and restarts pairing automatically — stale
+ *     creds used to poison every reconnect forever.
+ *   - pairing codes die when the socket reconnects; a fresh code is now
+ *     requested automatically and the exe is told the old one expired.
+ *   - pairing requests are single-flight + debounced (double clicks used to
+ *     spawn two sockets on one auth folder → conflict → instant logout).
+ *   - session backups only contain a WhatsApp blob once the account is really
+ *     linked, so the exe can never restore a dead/poisoned session.
+ *
  * Runtime: Node 18+ with tsx (or Bun).
  */
 
@@ -17,7 +32,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import zlib from 'node:zlib'
 
-const RELAY_VERSION = '2.0.0'
+const RELAY_VERSION = '2.1.0'
 const PORT = Number(process.env.PORT || 8080)
 const DATA_DIR = process.env.DATA_DIR || './data'
 const RELAY_NAME = process.env.RELAY_NAME || 'Aurora Cloud Relay'
@@ -174,6 +189,60 @@ async function qrMatrix(text: string): Promise<number[][]> {
     }
     return m
   } catch { return [] }
+}
+
+// ------------------------------------------------- phone normalization (WA)
+// Baileys' requestPairingCode builds `<phone>@s.whatsapp.net` VERBATIM — a
+// leading +, a 00 prefix or a trunk zero after the country code produces an
+// invalid JID, WhatsApp issues the code for a number that does not exist and
+// the phone then rejects it ("wrong number/code"). Normalize here, always.
+let libphone: any = null
+async function getLibphone(): Promise<any> {
+  if (libphone !== null) return libphone
+  try { libphone = await import('libphonenumber-js') } catch { libphone = false as any }
+  return libphone
+}
+interface NormPhone { ok: boolean; digits?: string; pretty?: string; err?: string }
+async function normalizeWaPhone(raw: string, country?: string): Promise<NormPhone> {
+  const s = String(raw || '').trim()
+  if (!s) return { ok: false, err: 'enter a phone number' }
+  let cleaned = s.replace(/[\s\-().]/g, '')
+  if (cleaned.startsWith('00')) cleaned = '+' + cleaned.slice(2)
+  const lp = await getLibphone()
+  const cc = (country || '').toUpperCase()
+  let pn: any = null
+  // 1) international (+… or plain digits that already carry the country code)
+  try { if (lp) pn = lp.parsePhoneNumberFromString(cleaned) } catch { /* try more */ }
+  // 2) trunk-zero fix: +98 0917… → +98 917… (classic mistake libphonenumber may not auto-fix)
+  if ((!pn || !pn.isValid()) && cleaned.startsWith('+') && lp) {
+    const body = cleaned.slice(1)
+    for (const cut of [1, 2, 3]) {
+      if (body.length > cut + 8 && body[cut] === '0') {
+        const cand = body.slice(0, cut) + body.slice(cut + 1)
+        try {
+          const t = lp.parsePhoneNumberFromString('+' + cand)
+          if (t && t.isValid()) { pn = t; break }
+        } catch { /* next */ }
+      }
+    }
+  }
+  // 3) local format (0917…) with the country picked in the exe
+  if ((!pn || !pn.isValid()) && cc && lp) {
+    try { pn = lp.parsePhoneNumberFromString(cleaned, cc) } catch { /* fallthrough */ }
+  }
+  if (pn && pn.isValid && pn.isValid()) {
+    return { ok: true, digits: String(pn.number).replace(/^\+/, ''), pretty: pn.formatInternational() }
+  }
+  // last resort: bare digits sanity (10-15) so we never regress below old behavior.
+  // A leading 0 can never be part of an E.164 number — that's a local format.
+  const digits = cleaned.replace(/^\+/, '').replace(/\D/g, '')
+  if (digits.startsWith('0')) {
+    return { ok: false, err: 'this looks like a local number (starts with 0) — include the country code (e.g. +98 917 123 4567) or pick your country next to the input' }
+  }
+  if (digits.length >= 10 && digits.length <= 15) {
+    return { ok: true, digits, pretty: '+' + digits }
+  }
+  return { ok: false, err: `not a valid WhatsApp number — use the full international format, e.g. +98 917 123 4567${cc ? ` (or a local number with ${cc} selected)` : ''}` }
 }
 
 // ------------------------------------------------------------- session rev
@@ -548,13 +617,18 @@ const wa = {
   phone: '',
   pairing: false,
   pairingCode: '',
-  pairPhone: '',           // phone for pairing-code flow (optional)
+  pairPhone: '',           // normalized digits for the pairing-code flow
+  pairPhonePretty: '',     // "+98 917 …" for display in the exe
   pairingCodeAsked: false, // requested once per socket generation
+  pairingCodeAt: 0,        // when the current code was issued
   err: '',
   sock: null as any,
   qr: null as { matrix: number[][]; text: string; at: number; gen: number } | null,
   gen: 0,                  // socket generation — exe uses it to drop stale QRs
   attempts: 0,
+  initBusy: false,         // single-flight guard: never two sockets on one auth folder
+  lastPairReqAt: 0,        // debounce for repeated pair requests
+  lastPairReqKey: '',
 }
 
 function waCredsPresent(): boolean {
@@ -564,7 +638,21 @@ function waCredsPresent(): boolean {
   } catch { return false }
 }
 
-async function waInit() {
+async function waInit(opts: { force?: boolean } = {}) {
+  // single-flight: a second concurrent socket on the same auth folder causes
+  // a 401 conflict. waRequestPair passes force because it OWNS the busy flag
+  // for the whole teardown+init sequence (no gap while it runs).
+  if (wa.initBusy && !opts.force) return
+  const owner = !opts.force
+  if (owner) wa.initBusy = true
+  try {
+    await waInitInner()
+  } finally {
+    if (owner) wa.initBusy = false
+  }
+}
+
+async function waInitInner() {
   let baileys: any
   try {
     baileys = await import('@whiskeysockets/baileys')
@@ -576,6 +664,7 @@ async function waInit() {
   const makeWASocket = baileys.default
   wa.gen++
   const myGen = wa.gen
+  wa.pairingCodeAsked = false // a fresh socket may request a fresh pairing code
 
   const { state, saveCreds } = await baileys.useMultiFileAuthState(path.join(DATA_DIR, 'wa-auth'))
   const { version } = await baileys.fetchLatestBaileysVersion().catch(() => ({ version: [2, 3000, 1023222034] }))
@@ -608,14 +697,16 @@ async function waInit() {
     if (qr) {
       if (wa.gen !== myGen) return // stale socket event
       wa.pairing = true
-      // pairing-code flow takes precedence over QR
-      if (wa.pairPhone && !wa.pairingCodeAsked) {
+      // pairing-code flow takes precedence over QR (code is re-requested on
+      // every new socket: the old code dies with the old socket)
+      if (wa.pairPhone && !wa.pairingCodeAsked && Date.now() - wa.pairingCodeAt > 10_000) {
         wa.pairingCodeAsked = true
         try {
           const code = await sock.requestPairingCode(wa.pairPhone)
           if (code && wa.gen === myGen) {
             wa.pairingCode = String(code).toUpperCase()
-            pushEvent({ type: 'wa.status', platform: 'wa', chat: '', from: 'wa', fromName: 'WhatsApp', text: `pairing code ready: ${wa.pairingCode}` })
+            wa.pairingCodeAt = Date.now()
+            pushEvent({ type: 'wa.status', platform: 'wa', chat: '', from: 'wa', fromName: 'WhatsApp', text: `pairing code for ${wa.pairPhonePretty || wa.pairPhone}: ${wa.pairingCode}` })
           }
         } catch (e: any) {
           wa.err = `pairing code failed: ${msg(e)}`
@@ -636,11 +727,28 @@ async function waInit() {
       wa.connected = false
       wa.qr = null // never serve a QR from a dead socket
       if (loggedOut) {
-        wa.pairing = false
+        // ROOT FIX: WhatsApp invalidated this device (removed / bad keys).
+        // Keeping the old noise keys poisons EVERY future handshake (the old
+        // behavior died here permanently). Wipe and auto-restart pairing.
+        try { sock.end?.(undefined) } catch { /* noop */ }
+        wa.sock = null
+        wipeWaAuth()
         wa.pairingCode = ''
-        wa.pairPhone = ''
-        pushEvent({ type: 'wa.status', platform: 'wa', chat: '', from: 'wa', fromName: 'WhatsApp', text: 'logged out (device removed) — pair again' })
+        wa.pairingCodeAsked = false
+        wa.phone = ''
+        wa.err = ''
+        wa.attempts = 0
+        wa.pairing = !!wa.pairPhone // phone pairing resumes automatically
+        bumpSessionRev('wa device reset')
+        pushEvent({ type: 'wa.status', platform: 'wa', chat: '', from: 'wa', fromName: 'WhatsApp', text: 'device was removed from the account — session keys reset, restarting pairing' })
+        setTimeout(() => waInit().catch(() => { /* logged */ }), 1500)
         return
+      }
+      // a plain reconnect invalidates any issued pairing code — say so and
+      // let the new socket request a fresh one automatically
+      if (wa.pairingCode) {
+        wa.pairingCode = ''
+        pushEvent({ type: 'wa.status', platform: 'wa', chat: '', from: 'wa', fromName: 'WhatsApp', text: 'pairing code expired (connection restarted) — a fresh code will appear automatically' })
       }
       wa.attempts++
       const delay = Math.min(3000 * wa.attempts, 15000)
@@ -649,12 +757,7 @@ async function waInit() {
         await sleep(delay)
         if (wa.gen === myGen) {
           try { sock.end?.(undefined) } catch { /* noop */ }
-          const keepPhone = wa.pairPhone
-          const keepAsked = wa.pairingCodeAsked
-          waInit().then(() => {
-            wa.pairPhone = keepPhone
-            wa.pairingCodeAsked = keepAsked
-          }).catch(() => { /* logged */ })
+          waInit().catch(() => { /* logged */ })
         }
       }
     } else if (connection === 'open') {
@@ -664,11 +767,14 @@ async function waInit() {
       wa.qr = null
       wa.pairingCode = ''
       wa.pairPhone = ''
+      wa.pairPhonePretty = ''
       wa.pairingCodeAsked = false
+      wa.pairingCodeAt = 0
       wa.attempts = 0
       wa.err = ''
       wa.phone = String(sock.user?.id || '').split(':')[0]
-      pushEvent({ type: 'wa.status', platform: 'wa', chat: '', from: 'wa', fromName: 'WhatsApp', text: `connected as ${wa.phone}` })
+      bumpSessionRev('wa linked')
+      pushEvent({ type: 'wa.status', platform: 'wa', chat: '', from: 'wa', fromName: 'WhatsApp', text: `connected as +${wa.phone} — linked successfully` })
     }
   })
 
@@ -703,19 +809,56 @@ async function waInit() {
   })
 }
 
-// (re)start WhatsApp linking: QR flow, or pairing-code when phone given
-async function waRequestPair(opts: { phone?: string } = {}) {
-  const phone = String(opts.phone || '').replace(/[\s\-()]/g, '')
-  wa.qr = null
-  wa.pairingCode = ''
-  wa.pairingCodeAsked = false
-  wa.pairPhone = phone
-  wa.pairing = true
-  wa.attempts = 0
-  try { await wa.sock?.end?.(undefined) } catch { /* noop */ }
-  await sleep(400)
-  await waInit()
-  pushEvent({ type: 'wa.status', platform: 'wa', chat: '', from: 'wa', fromName: 'WhatsApp', text: phone ? `requesting pairing code for ${phone}...` : 'new QR requested' })
+function wipeWaAuth() {
+  try { fs.rmSync(path.join(DATA_DIR, 'wa-auth'), { recursive: true, force: true }) } catch { /* noop */ }
+  try { fs.mkdirSync(path.join(DATA_DIR, 'wa-auth'), { recursive: true }) } catch { /* noop */ }
+}
+
+// (re)start WhatsApp linking: QR flow, or pairing-code when a phone is given.
+// Single-flight + debounced + always validated + always fresh keys.
+async function waRequestPair(opts: { phone?: string; country?: string; pretty?: string } = {}) {
+  // validate FIRST — bad input must never kill a running pairing session
+  let phone = '', pretty = opts.pretty || ''
+  if (opts.phone) {
+    const norm = await normalizeWaPhone(opts.phone, opts.country)
+    if (!norm.ok) throw new Error(norm.err || 'invalid phone number')
+    phone = String(norm.digits)
+    pretty = String(norm.pretty)
+  }
+  // debounce identical requests (double clicks / impatient retries)
+  const key = `${opts.phone || ''}|${opts.country || ''}`
+  if (key && key === wa.lastPairReqKey && Date.now() - wa.lastPairReqAt < 5000) {
+    return // same request is already running
+  }
+  wa.lastPairReqAt = Date.now()
+  wa.lastPairReqKey = key
+
+  if (wa.initBusy) throw new Error('pairing is already starting — wait a few seconds')
+  if (wa.connected) throw new Error(`already linked as +${wa.phone} — log out first to pair again`)
+  wa.initBusy = true
+  try {
+    try { await wa.sock?.end?.(undefined) } catch { /* noop */ }
+    wa.sock = null
+    wa.gen++
+    wipeWaAuth() // fresh noise identity per attempt — stale keys poison reconnects
+    wa.qr = null
+    wa.pairingCode = ''
+    wa.pairingCodeAsked = false
+    wa.pairingCodeAt = 0
+    wa.pairPhone = phone
+    wa.pairPhonePretty = pretty
+    wa.pairing = true
+    wa.attempts = 0
+    wa.err = ''
+    wa.connected = false
+    wa.phone = ''
+    bumpSessionRev('wa pair start')
+    await sleep(400)
+    await waInit({ force: true })
+    pushEvent({ type: 'wa.status', platform: 'wa', chat: '', from: 'wa', fromName: 'WhatsApp', text: phone ? `requesting pairing code for ${pretty || phone}…` : 'new QR requested' })
+  } finally {
+    wa.initBusy = false
+  }
 }
 
 async function waSend(a: any): Promise<any> {
@@ -734,14 +877,16 @@ async function waLogout() {
   try { await wa.sock?.end?.(undefined) } catch { /* noop */ }
   wa.sock = null
   wa.gen++
+  wipeWaAuth()
   wa.connected = false
   wa.phone = ''
   wa.pairing = false
   wa.pairingCode = ''
   wa.pairPhone = ''
+  wa.pairPhonePretty = ''
+  wa.pairingCodeAsked = false
+  wa.pairingCodeAt = 0
   wa.qr = null
-  fs.rmSync(path.join(DATA_DIR, 'wa-auth'), { recursive: true, force: true })
-  fs.mkdirSync(path.join(DATA_DIR, 'wa-auth'), { recursive: true })
   bumpSessionRev('wa logout')
   pushEvent({ type: 'wa.status', platform: 'wa', chat: '', from: 'wa', fromName: 'WhatsApp', text: 'session cleared — request new pairing' })
 }
@@ -750,14 +895,17 @@ async function waLogout() {
 function buildSessionExport() {
   const tgS = fs.existsSync(TG_SESSION_FILE()) ? fs.readFileSync(TG_SESSION_FILE(), 'utf8').trim() : ''
   const waFiles: Record<string, string> = {}
-  const dir = path.join(DATA_DIR, 'wa-auth')
-  try {
-    for (const f of fs.readdirSync(dir)) {
-      if (f.endsWith('.json')) waFiles[f] = fs.readFileSync(path.join(dir, f)).toString('base64')
-    }
-  } catch { /* empty */ }
-  const blob = JSON.stringify({ v: 2, rev: sessionRev, tg: tgS, wa: waFiles })
-  return { tg: tgS, wa: Object.keys(waFiles).length ? zlib.gzipSync(Buffer.from(blob)).toString('base64') : '', rev: sessionRev }
+  if (wa.connected) { // ONLY export a really-linked session — never poison the exe backup
+    const dir = path.join(DATA_DIR, 'wa-auth')
+    try {
+      for (const f of fs.readdirSync(dir)) {
+        if (f.endsWith('.json')) waFiles[f] = fs.readFileSync(path.join(dir, f)).toString('base64')
+      }
+    } catch { /* empty */ }
+  }
+  const waOk = wa.connected && Object.keys(waFiles).length > 0
+  const blob = JSON.stringify({ v: 3, rev: sessionRev, waOk, tg: tgS, wa: waFiles })
+  return { tg: tgS, wa: waOk ? zlib.gzipSync(Buffer.from(blob)).toString('base64') : '', rev: sessionRev }
 }
 
 async function sessionImport(body: any): Promise<string[]> {
@@ -775,22 +923,29 @@ async function sessionImport(body: any): Promise<string[]> {
   if (body?.wa && typeof body.wa === 'string' && body.wa.length > 20) {
     const obj = JSON.parse(zlib.gunzipSync(Buffer.from(body.wa, 'base64')).toString('utf8'))
     if (obj?.wa && typeof obj.wa === 'object') {
-      const dir = path.join(DATA_DIR, 'wa-auth')
-      fs.mkdirSync(dir, { recursive: true })
-      const cur = new Set(fs.readdirSync(dir))
-      for (const [name, data] of Object.entries(obj.wa)) {
-        fs.writeFileSync(path.join(dir, name), Buffer.from(String(data), 'base64'))
-        cur.delete(name)
+      if (obj.waOk !== true) {
+        // v3 guard: this blob was exported from an unlinked/stale session —
+        // restoring it would poison the relay forever. Skip it.
+        pushEvent({ type: 'wa.status', platform: 'wa', chat: '', from: 'wa', fromName: 'WhatsApp', text: 'skipped stale whatsapp backup (not linked when exported)' })
+      } else {
+        const dir = path.join(DATA_DIR, 'wa-auth')
+        fs.mkdirSync(dir, { recursive: true })
+        const cur = new Set(fs.readdirSync(dir))
+        for (const [name, data] of Object.entries(obj.wa)) {
+          fs.writeFileSync(path.join(dir, name), Buffer.from(String(data), 'base64'))
+          cur.delete(name)
+        }
+        for (const f of cur) fs.rmSync(path.join(dir, f), { force: true })
+        restored.push('wa')
+        wa.gen++
+        wa.pairing = false
+        wa.qr = null
+        try { await wa.sock?.end?.(undefined) } catch { /* noop */ }
+        wa.sock = null
+        wa.connected = false
+        pushEvent({ type: 'wa.status', platform: 'wa', chat: '', from: 'wa', fromName: 'WhatsApp', text: 'whatsapp session restored from PC backup' })
+        setTimeout(() => waInit().catch(() => { /* logged */ }), 500)
       }
-      for (const f of cur) fs.rmSync(path.join(dir, f), { force: true })
-      restored.push('wa')
-      wa.gen++
-      try { await wa.sock?.end?.(undefined) } catch { /* noop */ }
-      wa.sock = null
-      wa.connected = false
-      wa.pairing = false
-      pushEvent({ type: 'wa.status', platform: 'wa', chat: '', from: 'wa', fromName: 'WhatsApp', text: 'whatsapp session restored from PC backup' })
-      setTimeout(() => waInit().catch(() => { /* logged */ }), 500)
     }
   }
   bumpSessionRev('import')
@@ -832,7 +987,7 @@ code{background:#1a2030;padding:2px 8px;border-radius:6px;user-select:all}
 <div class="card"><h1>⚡ ${esc(RELAY_NAME)}</h1><small>v${RELAY_VERSION} · up ${Math.round((Date.now() - startedAt) / 1000)}s · ${agentConnected() ? '<span class="ok">VANTA.exe CONNECTED</span>' : '<span class="warn">exe offline (messages are queueing)</span>'}</small>
 <div class="grid">
 <span class="pill">Telegram <span class="${tg.authorized ? 'ok' : 'warn'}">${esc(tgLabel)}</span></span>
-<span class="pill">WhatsApp ${wa.connected ? `<span class="ok">${esc(wa.phone)}</span>` : wa.pairing ? '<span class="warn">pairing pending</span>' : '<span class="warn">disconnected</span>'}</span>
+<span class="pill">WhatsApp ${wa.connected ? `<span class="ok">${esc(wa.phone)}</span>` : wa.pairing ? `<span class="warn">pairing${wa.pairPhonePretty ? ' ' + esc(wa.pairPhonePretty) : ''}</span>` : '<span class="warn">disconnected</span>'}</span>
 <span class="pill">sessions rev ${sessionRev}${tg.authorized ? ' · tg✓' : ''}${waCredsPresent() ? ' · wa✓' : ''}</span>
 <span class="pill">events ${events.length}/${MAX_EVENTS}${droppedEvents ? ` (dropped ${droppedEvents})` : ''}</span>
 <span class="pill">actions ${actionsTotal}${actionsFailed ? ` · failed ${actionsFailed}` : ''} · ${actionTimes.length}/min</span>
@@ -882,6 +1037,9 @@ const server = http.createServer(async (req, res) => {
         phone: wa.phone,
         pairing: wa.pairing,
         pairingCode: wa.pairingCode,
+        pairPhone: wa.pairPhone,
+        pairPhonePretty: wa.pairPhonePretty,
+        pairingCodeAgeSec: wa.pairingCodeAt ? Math.round((Date.now() - wa.pairingCodeAt) / 1000) : 0,
         qrPending: !!wa.qr,
         qrGen: wa.gen,
         credsPresent: waCredsPresent(),
@@ -938,13 +1096,15 @@ const server = http.createServer(async (req, res) => {
       })
       return
     }
-    if (!wa.qr) { sendJson(res, 200, { ok: true, pending: false, pairing: wa.pairing, connected: wa.connected, pairingCode: wa.pairingCode, gen: wa.gen }); return }
+    if (!wa.qr) { sendJson(res, 200, { ok: true, pending: false, pairing: wa.pairing, connected: wa.connected, pairingCode: wa.pairingCode, pairPhone: wa.pairPhone, pairPhonePretty: wa.pairPhonePretty, gen: wa.gen }); return }
     sendJson(res, 200, {
       ok: true, pending: true, pairing: true, connected: wa.connected,
       qrMatrix: wa.qr.matrix, qrText: wa.qr.text,
       gen: wa.qr.gen,
       pairingCode: wa.pairingCode,
-      expiresSec: Math.max(0, 55 - Math.round((Date.now() - wa.qr.at) / 1000)),
+      pairPhone: wa.pairPhone,
+      pairPhonePretty: wa.pairPhonePretty,
+      expiresSec: Math.max(0, 20 - Math.round((Date.now() - wa.qr.at) / 1000)),
     })
     return
   }
@@ -1008,14 +1168,23 @@ const server = http.createServer(async (req, res) => {
         changed.push('tgApiInvalid')
       }
     }
-    if (body.whatsappAction === 'pair') { await waRequestPair({}); changed.push('whatsappPair') }
+    if (body.whatsappAction === 'pair') {
+      try {
+        await waRequestPair({})
+        changed.push('whatsappPair')
+      } catch (e: any) { sendJson(res, 502, { ok: false, error: msg(e) }); return }
+    }
     if (body.whatsappAction === 'paircode') {
       if (!body.waPhone) { sendJson(res, 400, { ok: false, error: 'waPhone required for paircode' }); return }
-      await waRequestPair({ phone: String(body.waPhone) })
-      changed.push('whatsappPairCode')
+      const norm = await normalizeWaPhone(String(body.waPhone), body.waPhoneCountry ? String(body.waPhoneCountry) : undefined)
+      if (!norm.ok) { sendJson(res, 400, { ok: false, error: `invalid phone number: ${norm.err}` }); return }
+      try {
+        await waRequestPair({ phone: String(norm.digits), country: body.waPhoneCountry ? String(body.waPhoneCountry) : undefined, pretty: String(norm.pretty) })
+        changed.push('whatsappPairCode')
+      } catch (e: any) { sendJson(res, 502, { ok: false, error: msg(e) }); return }
     }
     if (body.whatsappAction === 'logout') { await waLogout(); changed.push('whatsappLogout') }
-    sendJson(res, 200, { ok: true, changed, pairingCode: wa.pairingCode || '' })
+    sendJson(res, 200, { ok: true, changed, pairingCode: wa.pairingCode || '', waPhone: wa.pairPhone || '', waPhonePretty: wa.pairPhonePretty || '' })
     return
   }
 
@@ -1044,7 +1213,7 @@ server.listen(PORT, () => {
   console.log(`[relay] ${RELAY_NAME} v${RELAY_VERSION} listening on :${PORT}`)
   console.log(`[relay] status page: http://localhost:${PORT}/`)
   console.log(`[relay] AUTH_TOKEN: ${TOKEN}`)
-  pushEvent({ type: 'sys.log', platform: 'sys', chat: '', from: 'relay', fromName: 'Relay', text: `Aurora Cloud Relay v${RELAY_VERSION} booted (telegram userbot + whatsapp)` })
+  pushEvent({ type: 'sys.log', platform: 'sys', chat: '', from: 'relay', fromName: 'Relay', text: `Aurora Cloud Relay v${RELAY_VERSION} booted (telegram userbot + whatsapp · pairing hardening)` })
   loadRelayCfg()
   if (tg.apiId && tg.apiHash) {
     pushEvent({ type: 'tg.status', platform: 'tg', chat: '', from: 'tg', fromName: 'Telegram', text: `api credentials present (id ${tg.apiId}) — starting userbot` })
