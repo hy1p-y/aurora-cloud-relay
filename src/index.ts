@@ -49,7 +49,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import zlib from 'node:zlib'
 
-const RELAY_VERSION = '2.2.2'
+const RELAY_VERSION = '2.2.3'
 const PORT = Number(process.env.PORT || 8080)
 const DATA_DIR = process.env.DATA_DIR || './data'
 const RELAY_NAME = process.env.RELAY_NAME || 'Aurora Cloud Relay'
@@ -119,6 +119,34 @@ function pushEvent(e: Omit<Ev, 'seq' | 'ts'>) {
 interface ChatEntry { platform: 'wa' | 'tg'; id: string; name: string; type: 'user' | 'group' | 'channel'; ts: number }
 const waChats = new Map<string, ChatEntry>()
 const waLastSeenId = new Map<string, string>()  // newest message id per chat (read-all)
+const WA_CHATS_FILE = path.join(DATA_DIR, 'wa-chats.json')
+
+function loadWaChats() {
+  try {
+    if (fs.existsSync(WA_CHATS_FILE)) {
+      const arr = JSON.parse(fs.readFileSync(WA_CHATS_FILE, 'utf8'))
+      if (Array.isArray(arr)) {
+        for (const item of arr) {
+          if (item?.id) waChats.set(item.id, item)
+        }
+        console.log(`[relay] loaded ${waChats.size} contacts/chats from disk`)
+      }
+    }
+  } catch { /* ignore corrupted file */ }
+}
+
+let saveWaChatsTimer: any = null
+function scheduleSaveWaChats() {
+  if (saveWaChatsTimer) return
+  saveWaChatsTimer = setTimeout(() => {
+    saveWaChatsTimer = null
+    try {
+      fs.mkdirSync(DATA_DIR, { recursive: true })
+      fs.writeFileSync(WA_CHATS_FILE, JSON.stringify([...waChats.values()], null, 2), 'utf8')
+    } catch { /* noop */ }
+  }, 2000)
+}
+
 let tgDialogs: ChatEntry[] = []
 let tgDialogsAt = 0
 function upsertWaChat(jid: string, name: string, ts: number) {
@@ -131,6 +159,7 @@ function upsertWaChat(jid: string, name: string, ts: number) {
     nm = bare.length >= 8 ? `+${bare}` : bare
   }
   waChats.set(jid, { platform: 'wa', id: jid, name: nm, type, ts: Math.max(ts || 0, prev?.ts || 0) })
+  scheduleSaveWaChats()
 }
 async function tgFetchDialogs() {
   if (!tg.client || !tg.authorized) return
@@ -157,8 +186,9 @@ async function tgFetchDialogs() {
 // before the recipient opens it (and before any free-tier restart wipes it).
 // The file lands in DATA_DIR/media and the exe pulls it via /api/media/:id.
 const MEDIA_DIR = path.join(DATA_DIR, 'media')
-const mediaMsgCache = new Map<string, any>()   // recent raw messages (on-demand fetch)
-const MEDIA_CACHE_MAX = 40
+const mediaMsgCache = new Map<string, { raw: any; mime: string; mediaType: string }>()   // recent raw messages (on-demand fetch)
+const MEDIA_CACHE_MAX = 50
+
 function extFromMime(mime: string, mediaType: string): string {
   const m = String(mime || '').toLowerCase()
   if (m.includes('jpeg') || m.includes('jpg')) return 'jpg'
@@ -169,7 +199,7 @@ function extFromMime(mime: string, mediaType: string): string {
   if (m.includes('webm')) return 'webm'
   if (m.includes('ogg') || m.includes('opus')) return 'ogg'
   if (m.includes('pdf')) return 'pdf'
-  if (m.includes('mpeg')) return 'mp3'
+  if (m.includes('mpeg') || m.includes('mp3')) return 'mp3'
   if (mediaType === 'image') return 'jpg'
   if (mediaType === 'video') return 'mp4'
   if (mediaType === 'audio') return 'ogg'
@@ -192,20 +222,73 @@ function trimMediaDir() {
     for (const x of files.slice(MEDIA_CACHE_MAX)) fs.rmSync(path.join(MEDIA_DIR, x.f), { force: true })
   } catch { /* empty dir */ }
 }
-// message → { mediaId, mime, size, mediaType, viewOnce, caption } or null
+
+function unwrapMessage(msg: any): { inner: any; isViewOnce: boolean } {
+  let content = msg?.message || msg || {}
+  let isViewOnce = false
+  for (let i = 0; i < 10; i++) {
+    if (!content || typeof content !== 'object') break
+    if (content.deviceSentMessage) {
+      content = content.deviceSentMessage.message
+      continue
+    }
+    if (content.ephemeralMessage) {
+      content = content.ephemeralMessage.message
+      continue
+    }
+    if (content.viewOnceMessage) {
+      content = content.viewOnceMessage.message
+      isViewOnce = true
+      continue
+    }
+    if (content.viewOnceMessageV2) {
+      content = content.viewOnceMessageV2.message
+      isViewOnce = true
+      continue
+    }
+    if (content.viewOnceMessageV2Extension) {
+      content = content.viewOnceMessageV2Extension.message
+      isViewOnce = true
+      continue
+    }
+    if (content.documentWithCaptionMessage) {
+      content = content.documentWithCaptionMessage.message
+      continue
+    }
+    if (content.editedMessage) {
+      content = content.editedMessage.message
+      continue
+    }
+    break
+  }
+  return { inner: content || {}, isViewOnce }
+}
+
+// message → { raw, mediaType, mime, size, viewOnce, caption, secs } or null
 function mediaOf(message: any) {
-  const c = message?.message || {}
-  const vo = c.viewOnceMessage?.message || c.viewOnceMessageV2?.message || null
-  const inner: any = vo || c
-  const holders = ['imageMessage', 'videoMessage', 'audioMessage', 'stickerMessage', 'documentMessage']
-  for (const k of holders) {
+  const { inner, isViewOnce } = unwrapMessage(message)
+  const holders: Array<[string, string]> = [
+    ['imageMessage', 'image'],
+    ['videoMessage', 'video'],
+    ['audioMessage', 'audio'],
+    ['stickerMessage', 'sticker'],
+    ['documentMessage', 'document'],
+  ]
+  for (const [k, mediaType] of holders) {
     const m = inner[k]
     if (m) {
-      const mediaType = k.replace('Message', '')
+      let mime = String(m.mimetype || '')
+      if (!mime) {
+        if (mediaType === 'image') mime = 'image/jpeg'
+        else if (mediaType === 'video') mime = 'video/mp4'
+        else if (mediaType === 'audio') mime = 'audio/ogg'
+        else mime = 'application/octet-stream'
+      }
       return {
+        raw: m,
         mediaType,
-        viewOnce: !!vo,
-        mime: String(m.mimetype || ''),
+        viewOnce: isViewOnce,
+        mime,
         size: Number(m.fileLength || 0) || 0,
         caption: String(m.caption || ''),
         secs: Number(m.seconds || 0) || 0,
@@ -214,13 +297,19 @@ function mediaOf(message: any) {
   }
   return null
 }
-async function downloadWaMedia(message: any, mediaId: string, mime: string, mediaType: string): Promise<{ file: string; size: number }> {
+async function downloadWaMedia(rawMedia: any, mediaId: string, mime: string, mediaType: string): Promise<{ file: string; size: number }> {
   const baileys: any = await import('@whiskeysockets/baileys')
-  const c = message.message || {}
-  const vo = c.viewOnceMessage?.message || c.viewOnceMessageV2?.message
-  // unwrap view-once so the downloader sees imageMessage/videoMessage directly
-  const dlMsg = vo ? { key: message.key, message: vo } : message
-  const buf: Buffer = await baileys.downloadMediaMessage(dlMsg, 'buffer', {})
+  let buf: Buffer
+  try {
+    const stream = await baileys.downloadContentFromMessage(rawMedia, mediaType, {})
+    const chunks: Buffer[] = []
+    for await (const chunk of stream) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk))
+    buf = Buffer.concat(chunks)
+  } catch (errStream: any) {
+    // fallback: wrap into simulated Baileys message
+    const dlMsg = { message: { [mediaType + 'Message']: rawMedia } }
+    buf = await baileys.downloadMediaMessage(dlMsg, 'buffer', {})
+  }
   fs.mkdirSync(MEDIA_DIR, { recursive: true })
   const safe = String(mediaId || '').replace(/[^A-Za-z0-9_-]/g, '').slice(0, 48) || 'media'
   const file = path.join(MEDIA_DIR, `${safe}.${extFromMime(mime, mediaType)}`)
@@ -817,7 +906,8 @@ async function waInitInner() {
     browser: browserProfile,
     logger: mkSilentLogger(),
     markOnlineOnConnect: false,      // don't force "online" presence on free tier
-    syncFullHistory: false,          // light footprint
+    syncFullHistory: true,           // sync chats & contacts
+    shouldSyncHistoryMessage: () => true, // accept WhatsApp history sync chunks
     generateHighQualityLinkPreview: false,
   })
   wa.sock = sock
@@ -925,13 +1015,26 @@ async function waInitInner() {
       wa.phone = String(sock.user?.id || '').split(':')[0]
       bumpSessionRev('wa linked')
       pushEvent({ type: 'wa.status', platform: 'wa', chat: '', from: 'wa', fromName: 'WhatsApp', text: `connected as +${wa.phone} — linked successfully` })
-      // prime the chat directory with all groups + self chat
+      // prime the chat directory with all groups and group participants
       try {
         sock.groupFetchAllParticipating().then((gs: any) => {
           let n = 0
-          for (const id of Object.keys(gs || {})) { upsertWaChat(id, gs[id]?.subject || '', 0); n++ }
+          for (const id of Object.keys(gs || {})) {
+            const g = gs[id]
+            upsertWaChat(id, g?.subject || '', 0)
+            n++
+            for (const p of g?.participants || []) {
+              if (p?.id) upsertWaChat(p.id, '', 0)
+            }
+          }
           if (n) pushEvent({ type: 'wa.status', platform: 'wa', chat: '', from: 'wa', fromName: 'WhatsApp', text: `chat directory ready (${waChats.size} chats)` })
         }).catch(() => { /* not critical */ })
+      } catch { /* not critical */ }
+      // request full app state resync for contacts from WhatsApp servers
+      try {
+        if (baileys.ALL_WA_PATCH_NAMES) {
+          sock.resyncAppState(baileys.ALL_WA_PATCH_NAMES, true).catch(() => {})
+        }
       } catch { /* not critical */ }
     }
   })
@@ -941,27 +1044,42 @@ async function waInitInner() {
     for (const message of m.messages || []) {
       try {
         const key = message.key || {}
-        const jid = key.remoteJid || ''
+        let jid = key.remoteJid || ''
+        if (!jid && message.message?.deviceSentMessage?.destinationJid) {
+          jid = message.message.deviceSentMessage.destinationJid
+        }
         if (!jid || jid === 'status@broadcast') continue
-        const c = message.message || {}
+        const { inner } = unwrapMessage(message)
         // chat directory: every message teaches us a chat + a display name
         upsertWaChat(jid, message.pushName || '', Date.now())
         if (key.participant) upsertWaChat(key.participant, message.pushName || '', 0)
         if (key.id) waLastSeenId.set(jid, String(key.id))
+
+        // if message contains vcards/contacts, extract them to chat directory
+        if (inner.contactMessage) {
+          const vcard = String(inner.contactMessage.vcard || '')
+          const fnMatch = vcard.match(/FN:(.+)/i)
+          const telMatch = vcard.match(/waid=(\d+)/i) || vcard.match(/TEL.*:([+0-9]+)/i)
+          if (telMatch) {
+            const clean = telMatch[1].replace(/[^0-9]/g, '')
+            if (clean.length >= 8) upsertWaChat(`${clean}@s.whatsapp.net`, fnMatch ? fnMatch[1].trim() : '', 0)
+          }
+        }
+
         // ---- media / view-once extraction
         const med = mediaOf(message)
         if (med) {
           const mediaId = String(key.id || '') || ('m' + Date.now())
           if (med.viewOnce) {
             // download NOW — before the recipient opens it / before it expires
-            downloadWaMedia(message, mediaId, med.mime, med.mediaType)
+            downloadWaMedia(med.raw, mediaId, med.mime, med.mediaType)
               .then((r) => pushEvent({ type: 'wa.media', platform: 'wa', chat: jid, from: key.participant || jid, fromName: message.pushName || '',
                 text: `[view-once ${med.mediaType}${med.secs ? ` ${med.secs}s` : ''}] ${med.caption}`.trim(),
                 extra: { id: mediaId, fromMe: !!key.fromMe, ts: message.messageTimestamp, mediaId, mime: med.mime, size: r.size, viewOnce: true, mediaType: med.mediaType } }))
               .catch((e: any) => pushEvent({ type: 'wa.status', platform: 'wa', chat: jid, from: 'wa', fromName: 'WhatsApp', text: `view-once download failed: ${msg(e).slice(0, 140)}` }))
           } else {
             // regular media: cache the raw message, pull bytes on demand
-            mediaMsgCache.set(mediaId, message)
+            mediaMsgCache.set(mediaId, { raw: med.raw, mime: med.mime, mediaType: med.mediaType })
             if (mediaMsgCache.size > MEDIA_CACHE_MAX) {
               const first = mediaMsgCache.keys().next().value as string
               mediaMsgCache.delete(first)
@@ -974,10 +1092,10 @@ async function waInitInner() {
           continue
         }
         const text =
-          c.conversation ||
-          c.extendedTextMessage?.text ||
-          c.buttonsResponseMessage?.selectedButtonId ||
-          c.listResponseMessage?.singleSelectReply?.selectedRowId ||
+          inner.conversation ||
+          inner.extendedTextMessage?.text ||
+          inner.buttonsResponseMessage?.selectedButtonId ||
+          inner.listResponseMessage?.singleSelectReply?.selectedRowId ||
           ''
         if (!text && !key.fromMe) continue // skip empty
         pushEvent({
@@ -1344,6 +1462,20 @@ const server = http.createServer(async (req, res) => {
   if (url.pathname === '/api/chats' && req.method === 'GET') {
     const plat = (url.searchParams.get('platform') || 'all').toLowerCase()
     const refresh = url.searchParams.get('refresh') === '1'
+    if (refresh && wa.sock && wa.connected) {
+      try {
+        import('@whiskeysockets/baileys').then((baileys: any) => {
+          wa.sock?.groupFetchAllParticipating().then((gs: any) => {
+            for (const id of Object.keys(gs || {})) {
+              const g = gs[id]
+              upsertWaChat(id, g?.subject || '', 0)
+              for (const p of g?.participants || []) if (p?.id) upsertWaChat(p.id, '', 0)
+            }
+          }).catch(() => {})
+          if (baileys.ALL_WA_PATCH_NAMES) wa.sock?.resyncAppState(baileys.ALL_WA_PATCH_NAMES, true).catch(() => {})
+        }).catch(() => {})
+      } catch { /* best effort */ }
+    }
     if ((plat === 'tg' || plat === 'all') && tg.authorized && (refresh || Date.now() - tgDialogsAt > 120_000)) {
       tgDialogsAt = Date.now() // claim BEFORE fetching (avoid parallel storms)
       await tgFetchDialogs().catch(() => { /* best effort */ })
@@ -1365,9 +1497,11 @@ const server = http.createServer(async (req, res) => {
     if (!file && mediaMsgCache.has(mediaId)) {
       // on-demand download for regular (non view-once) media
       try {
-        const raw = mediaMsgCache.get(mediaId)
-        const med = mediaOf(raw)
-        if (med) { const r = await downloadWaMedia(raw, mediaId, med.mime, med.mediaType); file = r.file }
+        const cached = mediaMsgCache.get(mediaId)
+        if (cached?.raw) {
+          const r = await downloadWaMedia(cached.raw, mediaId, cached.mime, cached.mediaType)
+          file = r.file
+        }
       } catch (e: any) { sendJson(res, 502, { ok: false, error: `download failed: ${msg(e).slice(0, 140)}` }); return }
     }
     if (!file) { sendJson(res, 404, { ok: false, error: 'media expired (free-tier restart?) — view-once files are only kept briefly' }); return }
@@ -1528,6 +1662,7 @@ server.listen(PORT, '0.0.0.0', () => {
   console.log(`[relay] status page: http://localhost:${PORT}/`)
   console.log(`[relay] AUTH_TOKEN: ${TOKEN}`)
   pushEvent({ type: 'sys.log', platform: 'sys', chat: '', from: 'relay', fromName: 'Relay', text: `Aurora Cloud Relay v${RELAY_VERSION} booted (telegram userbot + whatsapp · pairing hardening)` })
+  loadWaChats()
   loadRelayCfg()
   if (tg.apiId && tg.apiHash) {
     pushEvent({ type: 'tg.status', platform: 'tg', chat: '', from: 'tg', fromName: 'Telegram', text: `api credentials present (id ${tg.apiId}) — starting userbot` })
