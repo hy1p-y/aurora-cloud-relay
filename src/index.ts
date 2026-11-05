@@ -48,7 +48,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import zlib from 'node:zlib'
 
-const RELAY_VERSION = '2.2.0'
+const RELAY_VERSION = '2.2.1'
 const PORT = Number(process.env.PORT || 8080)
 const DATA_DIR = process.env.DATA_DIR || './data'
 const RELAY_NAME = process.env.RELAY_NAME || 'Aurora Cloud Relay'
