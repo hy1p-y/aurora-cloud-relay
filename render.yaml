@@ -16,3 +16,5 @@ services:
         sync: false
       - key: RELAY_NAME
         value: Aurora Cloud Relay
+      - key: KEEP_ALIVE_URL
+        value: https://aurora-cloud-relay.onrender.com

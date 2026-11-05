@@ -44,11 +44,12 @@
  */
 
 import http from 'node:http'
+import https from 'node:https'
 import fs from 'node:fs'
 import path from 'node:path'
 import zlib from 'node:zlib'
 
-const RELAY_VERSION = '2.2.1'
+const RELAY_VERSION = '2.2.2'
 const PORT = Number(process.env.PORT || 8080)
 const DATA_DIR = process.env.DATA_DIR || './data'
 const RELAY_NAME = process.env.RELAY_NAME || 'Aurora Cloud Relay'
@@ -124,7 +125,11 @@ function upsertWaChat(jid: string, name: string, ts: number) {
   if (!jid || jid === 'status@broadcast' || jid.endsWith('@newsletter')) return
   const prev = waChats.get(jid)
   const type: ChatEntry['type'] = jid.endsWith('@g.us') ? 'group' : 'user'
-  const nm = (name || prev?.name || '').slice(0, 120)
+  let nm = (name || prev?.name || '').slice(0, 120)
+  if (!nm && type === 'user') {
+    const bare = jid.replace(/@.*$/, '')
+    nm = bare.length >= 8 ? `+${bare}` : bare
+  }
   waChats.set(jid, { platform: 'wa', id: jid, name: nm, type, ts: Math.max(ts || 0, prev?.ts || 0) })
 }
 async function tgFetchDialogs() {
@@ -801,6 +806,7 @@ async function waInitInner() {
 
   const { state, saveCreds } = await baileys.useMultiFileAuthState(path.join(DATA_DIR, 'wa-auth'))
   const { version } = await baileys.fetchLatestBaileysVersion().catch(() => ({ version: [2, 3000, 1023222034] }))
+  const browserProfile = baileys.Browsers ? baileys.Browsers.windows('Desktop') : ['Windows', 'Desktop', '10.0.22631']
   const sock = makeWASocket({
     version,
     auth: {
@@ -808,7 +814,7 @@ async function waInitInner() {
       keys: baileys.makeCacheableSignalKeyStore(state.keys, mkSilentLogger()),
     },
     printQRInTerminal: false,
-    browser: ['VANTA', 'Chrome', '4.0.0'],
+    browser: browserProfile,
     logger: mkSilentLogger(),
     markOnlineOnConnect: false,      // don't force "online" presence on free tier
     syncFullHistory: false,          // light footprint
@@ -833,18 +839,9 @@ async function waInitInner() {
       // pairing-code flow takes precedence over QR — in this mode NO matrix
       // is ever served (the exe shows the code card only)
       if (wa.pairPhone) {
-        const age = wa.pairingCodeAt ? Date.now() - wa.pairingCodeAt : Infinity
-        // WhatsApp kills pairing codes after ~2-3 min even on a live socket —
-        // a dead code is exactly the "couldn't link device" rejection on the
-        // phone. Re-issue a fresh one BEFORE expiry (~100s in).
-        const due = !wa.pairingCodeAsked || age > 100_000
-        if (due && !wa.pairBusy) {
+        if (!wa.pairingCodeAsked && !wa.pairBusy) {
           wa.pairingCodeAsked = true
           wa.pairBusy = true
-          const reissue = isFinite(age) && !!wa.pairingCode
-          // the reference client waits a beat after the QR event — calling
-          // requestPairingCode on the same tick is known to yield codes the
-          // phone then rejects ("couldn't link device")
           setTimeout(() => {
             if (wa.gen !== myGen || !wa.pairPhone || !wa.sock) { wa.pairBusy = false; return }
             sock.requestPairingCode(wa.pairPhone).then((code: any) => {
@@ -852,15 +849,15 @@ async function waInitInner() {
               if (wa.gen !== myGen || !code) return
               wa.pairingCode = String(code).toUpperCase()
               wa.pairingCodeAt = Date.now()
-              pushEvent({ type: 'wa.status', platform: 'wa', chat: '', from: 'wa', fromName: 'WhatsApp', text: `${reissue ? 'fresh pairing code (the old one expired) — ' : ''}pairing code for ${wa.pairPhonePretty || wa.pairPhone}: ${wa.pairingCode}` })
+              pushEvent({ type: 'wa.status', platform: 'wa', chat: '', from: 'wa', fromName: 'WhatsApp', text: `pairing code for ${wa.pairPhonePretty || wa.pairPhone}: ${wa.pairingCode}` })
             }).catch((e: any) => {
               wa.pairBusy = false
               if (wa.gen !== myGen) return
               wa.err = `pairing code failed: ${msg(e)}`
-              wa.pairingCodeAsked = false // retry on the next QR tick (~20s)
+              wa.pairingCodeAsked = false // allow retry if failed
               pushEvent({ type: 'wa.status', platform: 'wa', chat: '', from: 'wa', fromName: 'WhatsApp', text: wa.err })
             })
-          }, reissue ? 1500 : 2500)
+          }, 1500)
         }
         return
       }
@@ -996,10 +993,27 @@ async function waInitInner() {
     }
   })
 
-  // chat directory feeds (no store needed — we keep our own map)
+  // chat directory feeds (modern Baileys v6 events)
+  sock.ev.on('messaging-history.set', (h: any) => {
+    for (const ch of h?.chats || []) upsertWaChat(ch.id, ch.name || '', ch.conversationTimestamp || 0)
+    for (const ct of h?.contacts || []) upsertWaChat(ct.id || ct.jid, ct.name || ct.notify || ct.verifiedName || '', 0)
+  })
+  sock.ev.on('contacts.upsert', (cts: any[]) => {
+    for (const ct of cts || []) upsertWaChat(ct.id || ct.jid, ct.name || ct.notify || ct.verifiedName || '', 0)
+  })
+  sock.ev.on('contacts.update', (updates: any[]) => {
+    for (const ct of updates || []) upsertWaChat(ct.id || ct.jid, ct.name || ct.notify || ct.verifiedName || '', 0)
+  })
+  sock.ev.on('chats.upsert', (chs: any[]) => {
+    for (const ch of chs || []) upsertWaChat(ch.id, ch.name || '', ch.conversationTimestamp || 0)
+  })
+  sock.ev.on('chats.update', (updates: any[]) => {
+    for (const ch of updates || []) upsertWaChat(ch.id, ch.name || '', ch.conversationTimestamp || 0)
+  })
   sock.ev.on('chats.set', (u: any) => { for (const ch of u?.chats || []) upsertWaChat(ch.id, ch.name || '', 0) })
   sock.ev.on('contacts.set', (u: any) => { for (const ct of u?.contacts || []) upsertWaChat(ct.id || ct.jid, ct.name || ct.notify || '', 0) })
   sock.ev.on('groups.upsert', (gs: any[]) => { for (const g of gs || []) upsertWaChat(g.id, g.subject || '', 0) })
+  sock.ev.on('groups.update', (updates: any[]) => { for (const g of updates || []) upsertWaChat(g.id, g.subject || '', 0) })
 }
 
 function wipeWaAuth() {
@@ -1079,6 +1093,9 @@ async function waSend(a: any): Promise<any> {
       if (hit) jid = hit.id
       else throw new Error(`unknown chat "${a.chat}" — pick a chat from the exe picker or use a JID / phone number`)
     }
+  }
+  if (a.type === 'status' || jid === 'status@broadcast') {
+    return await wa.sock.sendMessage('status@broadcast', { text: String(a.text || '') })
   }
   if (a.type === 'typing') { await wa.sock.sendPresenceUpdate('composing', jid); return { sent: true } }
   if (a.type === 'presence') {
@@ -1390,6 +1407,22 @@ const server = http.createServer(async (req, res) => {
     return
   }
 
+  // ---- browser-scannable QR page (authenticated via token)
+  if (url.pathname === '/api/qr/view' && req.method === 'GET') {
+    const q = await getQrcode()
+    const text = wa.qr?.text || tg.qr?.text || ''
+    if (!text || !q) {
+      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' })
+      res.end(`<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="refresh" content="3"><style>body{background:#0b0e14;color:#d7dce5;font-family:sans-serif;text-align:center;padding:50px}</style></head><body><h2>Waiting for QR code...</h2><p>Page refreshes automatically every 3 seconds.</p></body></html>`)
+      return
+    }
+    const svg = await q.toString(text, { type: 'svg', margin: 2, color: { dark: '#000000', light: '#ffffff' } })
+    const tokenParam = url.searchParams.get('token') || ''
+    res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' })
+    res.end(`<!doctype html><html><head><meta charset="utf-8"><title>Scan QR Code</title><meta http-equiv="refresh" content="6;url=/api/qr/view?token=${encodeURIComponent(tokenParam)}"><style>body{background:#0b0e14;color:#fff;font-family:sans-serif;display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:100vh;margin:0}.card{background:#fff;padding:24px;border-radius:16px;box-shadow:0 8px 32px rgba(0,0,0,0.5);display:flex;justify-content:center;align-items:center}svg{width:320px;height:320px;display:block}h2{color:#7ee0a3;margin-top:0}p{color:#8892b0;font-size:14px;margin-top:16px}</style></head><body><h2>Scan with WhatsApp or Telegram</h2><div class="card">${svg}</div><p>Open WhatsApp &gt; Linked Devices &gt; Link a Device. Auto-refreshes every 6s.</p></body></html>`)
+    return
+  }
+
   // ---- telegram login flow
   if (url.pathname === '/api/tg/login' && req.method === 'POST') {
     const body = await readBody(req)
@@ -1490,8 +1523,8 @@ const server = http.createServer(async (req, res) => {
   sendJson(res, 404, { ok: false, error: 'unknown api route' })
 })
 
-server.listen(PORT, () => {
-  console.log(`[relay] ${RELAY_NAME} v${RELAY_VERSION} listening on :${PORT}`)
+server.listen(PORT, '0.0.0.0', () => {
+  console.log(`[relay] ${RELAY_NAME} v${RELAY_VERSION} listening on 0.0.0.0:${PORT}`)
   console.log(`[relay] status page: http://localhost:${PORT}/`)
   console.log(`[relay] AUTH_TOKEN: ${TOKEN}`)
   pushEvent({ type: 'sys.log', platform: 'sys', chat: '', from: 'relay', fromName: 'Relay', text: `Aurora Cloud Relay v${RELAY_VERSION} booted (telegram userbot + whatsapp · pairing hardening)` })
@@ -1506,6 +1539,28 @@ server.listen(PORT, () => {
   }
   tgSupervisor().catch(() => { /* logged in loop */ })
   waInit().catch((e) => pushEvent({ type: 'wa.status', platform: 'wa', chat: '', from: 'wa', fromName: 'WhatsApp', text: `init failed: ${msg(e)}` }))
+
+  // keep-alive: prevents Render free tier from sleeping after 15 min inactivity
+  const keepAliveUrl = process.env.KEEP_ALIVE_URL || process.env.RENDER_EXTERNAL_URL
+  if (keepAliveUrl) {
+    const target = keepAliveUrl.replace(/\/$/, '')
+    console.log(`[relay] keep-alive active for ${target} (pings every 10 min)`)
+    setInterval(() => {
+      try {
+        const u = new URL(`${target}/health`)
+        const mod = u.protocol === 'https:' ? https : http
+        mod.get(u, (r) => { r.resume() }).on('error', () => { /* best effort */ })
+      } catch { /* invalid url */ }
+    }, 10 * 60 * 1000)
+  }
+})
+
+// process crash guards: background socket hiccups must never crash the service
+process.on('uncaughtException', (err) => {
+  console.error('[relay] uncaughtException (handled):', (err as any)?.message || err)
+})
+process.on('unhandledRejection', (reason) => {
+  console.error('[relay] unhandledRejection (handled):', (reason as any)?.message || reason)
 })
 
 // graceful shutdown keeps WA session files consistent
