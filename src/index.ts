@@ -145,6 +145,8 @@ async function readBody(req: http.IncomingMessage): Promise<any> {
 }
 
 // ================================================================== TELEGRAM
+let tgAbort: AbortController | null = null
+
 const tg = {
   connected: false,
   botToken: process.env.TELEGRAM_BOT_TOKEN || '',
@@ -156,11 +158,12 @@ const tg = {
 }
 
 async function tgApi(method: string, payload: any): Promise<any> {
+  const signal = tgAbort ? tgAbort.signal : AbortSignal.timeout(25_000)
   const r = await fetch(`https://api.telegram.org/bot${tg.botToken}/${method}`, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify(payload),
-    signal: AbortSignal.timeout(25_000),
+    signal,
   })
   const j: any = await r.json().catch(() => ({}))
   if (!j.ok) throw new Error(j.description || `HTTP ${r.status}`)
@@ -172,6 +175,7 @@ async function tgLoop() {
   tg.loopOn = true
   tg.connected = false
   tg.err = ''
+  tgAbort = new AbortController()
   pushEvent({ type: 'tg.status', platform: 'tg', chat: '', from: 'tg', fromName: 'Telegram', text: 'polling loop starting' })
   while (tg.loopOn && tg.botToken) {
     try {
@@ -205,12 +209,15 @@ async function tgLoop() {
         })
       }
     } catch (e: any) {
+      if (e?.name === 'AbortError') break
       tg.connected = false
       tg.err = String(e?.message || e)
       pushEvent({ type: 'tg.status', platform: 'tg', chat: '', from: 'tg', fromName: 'Telegram', text: `error: ${tg.err.slice(0, 200)}` })
       await new Promise(r => setTimeout(r, 5000))
     }
   }
+  tg.loopOn = false
+  tg.connected = false
   pushEvent({ type: 'tg.status', platform: 'tg', chat: '', from: 'tg', fromName: 'Telegram', text: tg.botToken ? 'polling loop stopped' : 'no bot token configured' })
 }
 
@@ -292,6 +299,7 @@ async function waInit() {
       pushEvent({ type: 'wa.status', platform: 'wa', chat: '', from: 'wa', fromName: 'WhatsApp', text: `connection closed (${code})${loggedOut ? ' — logged out' : ' — reconnecting'}` })
       if (!loggedOut) {
         await new Promise(r => setTimeout(r, 3000))
+        try { wa.sock?.end?.(undefined) } catch {}
         try { waInit() } catch { /* retry next tick */ }
       }
     } else if (connection === 'open') {
@@ -379,9 +387,6 @@ async function doAction(a: any): Promise<any> {
 function esc(s: any): string { return String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c] as string)) }
 
 function statusPage(): string {
-  const qrSvg = wa.qr && wa.qr.svg ? wa.qr.svg : ''
-  const recent = events.slice(-20).reverse().map(e =>
-    `<tr><td class="m">${new Date(e.ts).toISOString().slice(11, 19)}</td><td>${esc(e.platform)}/${esc(e.type)}</td><td class="m">${esc(e.fromName || e.from || '')}</td><td>${esc((e.text || '').slice(0, 90))}</td></tr>`).join('')
   return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>${esc(RELAY_NAME)}</title><style>
 :root{color-scheme:dark}
@@ -393,18 +398,17 @@ h1{font-size:18px;margin:0 0 4px;color:#7ee0a3}small{color:#68738a}
 .pill{border:1px solid #232a38;border-radius:99px;padding:4px 12px;font-size:12px}
 code{background:#1a2030;padding:2px 8px;border-radius:6px;user-select:all}
 table{width:100%;border-collapse:collapse;margin-top:10px}td{padding:4px 8px;border-top:1px solid #1a2030}
-.m{color:#68738a}.qr{float:right;background:#fff;padding:10px;border-radius:10px}
+.m{color:#68738a}
 </style></head><body>
 <div class="card"><h1>⚡ ${esc(RELAY_NAME)}</h1><small>v${RELAY_VERSION} · up ${Math.round((Date.now() - startedAt) / 1000)}s · ${agentConnected() ? '<span class="ok">AuroraSuite.exe CONNECTED</span>' : '<span class="warn">exe offline (messages are queueing)</span>'}</small>
-${wa.pairing && qrSvg ? `<div class="qr">${qrSvg}</div>` : ''}
 <div class="grid">
 <span class="pill">Telegram ${tg.connected ? `<span class="ok">@${esc(tg.botUsername)}</span>` : `<span class="warn">${tg.botToken ? 'reconnecting…' : 'not configured'}</span>`}</span>
 <span class="pill">WhatsApp ${wa.connected ? `<span class="ok">${esc(wa.phone)}</span>` : wa.pairing ? '<span class="warn">QR pairing pending</span>' : '<span class="warn">disconnected</span>'}</span>
 <span class="pill">events buffered ${events.length}/${MAX_EVENTS}${droppedEvents ? ` (dropped ${droppedEvents})` : ''}</span>
 <span class="pill">actions ${actionsTotal}${actionsFailed ? ` · failed ${actionsFailed}` : ''} · ${actionTimes.length}/min</span>
 </div>
-<div style="margin-top:14px">Auth token for AuroraSuite.exe: <code>${esc(TOKEN)}</code></div></div>
-<div class="card"><b>Recent traffic</b><table>${recent || '<tr><td class="m">nothing yet — connect your accounts</td></tr>'}</table></div>
+<div style="margin-top:14px;color:#68738a">Authentication: <span class="ok">Protected</span> (token auth active)</div></div>
+<div class="card"><b>Relay Activity</b><div style="margin-top:8px;color:#68738a">Message traffic and WhatsApp pairing QR codes are authenticated. Connect with the VANTA desktop client to pair devices and view live events.</div></div>
 </body></html>`
 }
 
@@ -487,11 +491,18 @@ const server = http.createServer(async (req, res) => {
     if (!body) { sendJson(res, 400, { ok: false, error: 'invalid JSON body' }); return }
     const changed: string[] = []
     if (typeof body.telegramBotToken === 'string' && body.telegramBotToken.trim()) {
-      tg.botToken = body.telegramBotToken.trim()
-      tg.loopOn = false
-      tg.offset = 0
-      changed.push('telegramBotToken')
-      tgLoop().catch(() => { /* logged in loop */ })
+      const newToken = body.telegramBotToken.trim()
+      if (newToken !== tg.botToken) {
+        tg.botToken = newToken
+        tg.loopOn = false
+        tg.offset = 0
+        if (tgAbort) {
+          try { tgAbort.abort() } catch {}
+          tgAbort = null
+        }
+        changed.push('telegramBotToken')
+        setTimeout(() => tgLoop().catch(() => { /* logged in loop */ }), 200)
+      }
     }
     if (body.whatsappAction === 'pair') { wa.qr = null; wa.pairing = true; await waInit().catch(() => { /* logged */ }); changed.push('whatsappPair') }
     if (body.whatsappAction === 'logout') { await waLogout(); changed.push('whatsappLogout') }
