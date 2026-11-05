@@ -9,6 +9,22 @@
  * Telegram runs as the USER'S OWN ACCOUNT (userbot) — no BotFather bot.
  * WhatsApp links by QR code OR 8-digit phone pairing code.
  *
+ * v2.2.1 — "couldn't link device" + unreadable QR fixes:
+ *   - requestPairingCode is no longer fired on the same tick as the QR event
+ *     (2.5s delay — same-tick calls yield codes the phone rejects with
+ *     "couldn't link device, check the phone number").
+ *   - pairing codes now AUTO-REFRESH every ~100s on a live socket — WhatsApp
+ *     kills codes after ~2-3 min, and every previously shown code was already
+ *     dead by the time the user typed it in.
+ *   - re-clicking "pair by code" with the same number no longer restarts the
+ *     socket (which killed the code being typed) — a still-fresh code is
+ *     simply re-shown.
+ *   - phone-mode pairing never serves a QR matrix anymore (the exe shows the
+ *     code card + the number the code was issued for).
+ *   - QR: exe-side card now has a full 4-module quiet zone, pure-white panel
+ *     and NO overlay drawn on the modules (the old translucent shimmer band
+ *     made the code unscannable).
+ *
  * v2.1.0 — pairing hardening:
  *   - phone numbers are normalized with libphonenumber (accepts +98…, 0098…,
  *     98…, and local 0917… when a country is selected; trunk zeros after the
@@ -736,6 +752,7 @@ const wa = {
   pairPhonePretty: '',     // "+98 917 …" for display in the exe
   pairingCodeAsked: false, // requested once per socket generation
   pairingCodeAt: 0,        // when the current code was issued
+  pairBusy: false,         // a requestPairingCode call is scheduled / in flight
   err: '',
   sock: null as any,
   qr: null as { matrix: number[][]; text: string; at: number; gen: number } | null,
@@ -780,6 +797,7 @@ async function waInitInner() {
   wa.gen++
   const myGen = wa.gen
   wa.pairingCodeAsked = false // a fresh socket may request a fresh pairing code
+  wa.pairBusy = false
 
   const { state, saveCreds } = await baileys.useMultiFileAuthState(path.join(DATA_DIR, 'wa-auth'))
   const { version } = await baileys.fetchLatestBaileysVersion().catch(() => ({ version: [2, 3000, 1023222034] }))
@@ -812,20 +830,37 @@ async function waInitInner() {
     if (qr) {
       if (wa.gen !== myGen) return // stale socket event
       wa.pairing = true
-      // pairing-code flow takes precedence over QR (code is re-requested on
-      // every new socket: the old code dies with the old socket)
-      if (wa.pairPhone && !wa.pairingCodeAsked && Date.now() - wa.pairingCodeAt > 10_000) {
-        wa.pairingCodeAsked = true
-        try {
-          const code = await sock.requestPairingCode(wa.pairPhone)
-          if (code && wa.gen === myGen) {
-            wa.pairingCode = String(code).toUpperCase()
-            wa.pairingCodeAt = Date.now()
-            pushEvent({ type: 'wa.status', platform: 'wa', chat: '', from: 'wa', fromName: 'WhatsApp', text: `pairing code for ${wa.pairPhonePretty || wa.pairPhone}: ${wa.pairingCode}` })
-          }
-        } catch (e: any) {
-          wa.err = `pairing code failed: ${msg(e)}`
-          pushEvent({ type: 'wa.status', platform: 'wa', chat: '', from: 'wa', fromName: 'WhatsApp', text: wa.err })
+      // pairing-code flow takes precedence over QR — in this mode NO matrix
+      // is ever served (the exe shows the code card only)
+      if (wa.pairPhone) {
+        const age = wa.pairingCodeAt ? Date.now() - wa.pairingCodeAt : Infinity
+        // WhatsApp kills pairing codes after ~2-3 min even on a live socket —
+        // a dead code is exactly the "couldn't link device" rejection on the
+        // phone. Re-issue a fresh one BEFORE expiry (~100s in).
+        const due = !wa.pairingCodeAsked || age > 100_000
+        if (due && !wa.pairBusy) {
+          wa.pairingCodeAsked = true
+          wa.pairBusy = true
+          const reissue = isFinite(age) && !!wa.pairingCode
+          // the reference client waits a beat after the QR event — calling
+          // requestPairingCode on the same tick is known to yield codes the
+          // phone then rejects ("couldn't link device")
+          setTimeout(() => {
+            if (wa.gen !== myGen || !wa.pairPhone || !wa.sock) { wa.pairBusy = false; return }
+            sock.requestPairingCode(wa.pairPhone).then((code: any) => {
+              wa.pairBusy = false
+              if (wa.gen !== myGen || !code) return
+              wa.pairingCode = String(code).toUpperCase()
+              wa.pairingCodeAt = Date.now()
+              pushEvent({ type: 'wa.status', platform: 'wa', chat: '', from: 'wa', fromName: 'WhatsApp', text: `${reissue ? 'fresh pairing code (the old one expired) — ' : ''}pairing code for ${wa.pairPhonePretty || wa.pairPhone}: ${wa.pairingCode}` })
+            }).catch((e: any) => {
+              wa.pairBusy = false
+              if (wa.gen !== myGen) return
+              wa.err = `pairing code failed: ${msg(e)}`
+              wa.pairingCodeAsked = false // retry on the next QR tick (~20s)
+              pushEvent({ type: 'wa.status', platform: 'wa', chat: '', from: 'wa', fromName: 'WhatsApp', text: wa.err })
+            })
+          }, reissue ? 1500 : 2500)
         }
         return
       }
@@ -850,6 +885,7 @@ async function waInitInner() {
         wipeWaAuth()
         wa.pairingCode = ''
         wa.pairingCodeAsked = false
+        wa.pairBusy = false
         wa.phone = ''
         wa.err = ''
         wa.attempts = 0
@@ -861,6 +897,7 @@ async function waInitInner() {
       }
       // a plain reconnect invalidates any issued pairing code — say so and
       // let the new socket request a fresh one automatically
+      wa.pairBusy = false
       if (wa.pairingCode) {
         wa.pairingCode = ''
         pushEvent({ type: 'wa.status', platform: 'wa', chat: '', from: 'wa', fromName: 'WhatsApp', text: 'pairing code expired (connection restarted) — a fresh code will appear automatically' })
@@ -884,6 +921,7 @@ async function waInitInner() {
       wa.pairPhone = ''
       wa.pairPhonePretty = ''
       wa.pairingCodeAsked = false
+      wa.pairBusy = false
       wa.pairingCodeAt = 0
       wa.attempts = 0
       wa.err = ''
@@ -988,6 +1026,18 @@ async function waRequestPair(opts: { phone?: string; country?: string; pretty?: 
   wa.lastPairReqAt = Date.now()
   wa.lastPairReqKey = key
 
+  // same number + still-fresh code + live pairing session → just re-show the
+  // current code. Restarting the socket here would kill a code the user may
+  // be entering on their phone RIGHT NOW ("couldn't link device" on their end).
+  if (
+    phone && phone === wa.pairPhone && wa.pairingCode &&
+    wa.pairingCodeAt && Date.now() - wa.pairingCodeAt < 90_000 &&
+    !wa.connected && wa.pairing
+  ) {
+    pushEvent({ type: 'wa.status', platform: 'wa', chat: '', from: 'wa', fromName: 'WhatsApp', text: `pairing code for ${pretty || phone}: ${wa.pairingCode} (still valid — no restart needed)` })
+    return
+  }
+
   if (wa.initBusy) throw new Error('pairing is already starting — wait a few seconds')
   if (wa.connected) throw new Error(`already linked as +${wa.phone} — log out first to pair again`)
   wa.initBusy = true
@@ -999,6 +1049,7 @@ async function waRequestPair(opts: { phone?: string; country?: string; pretty?: 
     wa.qr = null
     wa.pairingCode = ''
     wa.pairingCodeAsked = false
+    wa.pairBusy = false
     wa.pairingCodeAt = 0
     wa.pairPhone = phone
     wa.pairPhonePretty = pretty
@@ -1070,6 +1121,7 @@ async function waLogout() {
   wa.pairPhone = ''
   wa.pairPhonePretty = ''
   wa.pairingCodeAsked = false
+  wa.pairBusy = false
   wa.pairingCodeAt = 0
   wa.qr = null
   bumpSessionRev('wa logout')
