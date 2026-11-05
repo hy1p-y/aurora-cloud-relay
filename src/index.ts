@@ -1586,6 +1586,24 @@ const server = http.createServer(async (req, res) => {
     return
   }
 
+  // ---- chats restore (v2.2.5): the exe posts its durable on-disk picker
+  // directory so the contact list survives our ephemeral disk across deploys
+  if (url.pathname === '/api/chats/restore' && req.method === 'POST') {
+    const body = await readBody(req)
+    const arr = body?.chats
+    if (!Array.isArray(arr) || !arr.length) { sendJson(res, 400, { ok: false, error: 'chats array required' }); return }
+    let n = 0
+    for (const c of arr.slice(0, 600)) {
+      const id = String(c?.id || '')
+      if (!id) continue
+      upsertWaChat(id, String(c?.name || ''), Number(c?.ts) || 0)
+      n++
+    }
+    scheduleSaveWaChats()
+    sendJson(res, 200, { ok: true, merged: n, directory: waChats.size })
+    return
+  }
+
   // ---- media bytes (view-once saver + manual saves)
   if (url.pathname.startsWith('/api/media/') && req.method === 'GET') {
     const mediaId = decodeURIComponent(url.pathname.slice('/api/media/'.length)).replace(/[^A-Za-z0-9_-]/g, '').slice(0, 48)
