@@ -1,4 +1,4 @@
-# Aurora Cloud Relay v2 — Deploy Guide
+# Aurora Cloud Relay v2.2 — Deploy Guide
 
 A tiny always-on bridge between the **VANTA desktop exe** and your
 **own Telegram account (userbot)** + **WhatsApp**. It holds the messenger
@@ -24,6 +24,11 @@ VANTA.exe (your PC)  ←HTTPS poll/POST→  relay (free host)  ←MTProto/WS→ 
   VANTA automatically re-uploads the sessions — logins survive restarts.
 - Stale-QR bug fixed (socket generation tracking), smarter reconnects,
   lighter footprint for free tiers.
+- **v2.2**: view-once media is downloaded the moment it arrives (before the
+  recipient opens it) and served to the exe via `/api/media/:id`; the chat
+  directory (`/api/chats`) powers the exe's searchable target pickers;
+  poll / presence / read actions; lenient chat addressing (bare phone
+  numbers work).
 
 ## Requirements
 
@@ -121,6 +126,8 @@ console on first boot).
 | `/api/qr?platform=wa\|tg` | GET | current pairing QR (+ wa pairing code) |
 | `/api/tg/login` | POST | login flow: phone → code → password (or QR) |
 | `/api/config` | POST | set tg api keys, request wa pair/logout |
+| `/api/chats` | GET | the account's chat directory (exe pickers) |
+| `/api/media/:id` | GET | media bytes incl. captured view-once files |
 | `/api/session/export` | GET | session blob for PC backup |
 | `/api/session/import` | POST | restore sessions (used by the exe) |
 
